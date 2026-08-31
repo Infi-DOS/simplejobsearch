@@ -1,0 +1,64 @@
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+ngrok-policy.yml
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test and coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Runtime databases and application state
+/jobs.db
+/jobs.db-journal
+/jobs.db-shm
+/jobs.db-wal
+/data/*
+!/data/.gitkeep
+.nicegui/
+*.pid
+*.log
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+
+# Archived files
+archive

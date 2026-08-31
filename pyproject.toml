@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobsimplesearch"
+version = "0.1.0"
+description = "Database-driven LinkedIn job-search automation pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "APScheduler>=3.10,<4",
+  "google-genai>=1.0,<2",
+  "nicegui==3.16.0",
+  "pandas>=2.0,<3",
+  "pydantic>=2.0,<3",
+  "python-dotenv>=1.0,<2",
+  "python-jobspy>=1.1,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "ruff>=0.9,<1"]
+
+[project.scripts]
+jobsimplesearch = "jobsimplesearch.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+  "ai_extractor",
+  "app_nicegui",
+  "daily_collector",
+  "details_fetcher",
+  "metadata_gate",
+  "post_ai_engine",
+  "rule_engine",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

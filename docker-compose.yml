@@ -1,0 +1,23 @@
+services:
+  web:
+    build: .
+    command: ["jobsimplesearch", "web"]
+    env_file: .env
+    environment:
+      JOBSEARCH_DB_PATH: /app/data/jobs.db
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  scheduler:
+    build: .
+    command: ["jobsimplesearch", "scheduler"]
+    env_file: .env
+    environment:
+      JOBSEARCH_DB_PATH: /app/data/jobs.db
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
