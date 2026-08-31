@@ -13,5 +13,5 @@ RUN pip install --no-cache-dir .
 
 RUN mkdir -p /app/data
 EXPOSE 5000
-CMD ["jobsimplesearch", "web"]
+CMD ["simplejobsearch", "web"]
 

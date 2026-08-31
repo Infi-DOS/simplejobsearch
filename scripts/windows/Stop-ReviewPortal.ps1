@@ -31,7 +31,7 @@ $targets = @(
     @{
         Name = 'NiceGUI'
         PidFile = (Join-Path $runtimeDir 'nicegui.pid')
-        Marker = 'jobsimplesearch.cli web'
+        Marker = 'simplejobsearch.cli web'
     }
 )
 

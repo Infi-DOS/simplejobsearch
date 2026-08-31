@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from jobsimplesearch import config
-from jobsimplesearch.notifications.links import public_url, results_url, review_url
+from simplejobsearch import config
+from simplejobsearch.notifications.links import public_url, results_url, review_url
 
 
 def test_public_base_url_is_normalized(monkeypatch):

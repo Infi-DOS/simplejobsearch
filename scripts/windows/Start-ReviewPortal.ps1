@@ -84,7 +84,7 @@ if (-not $publicBaseUrl) {
     throw 'PUBLIC_BASE_URL must be configured before starting the review portal.'
 }
 
-$webProcess = Get-ManagedProcess -PidFile $webPidFile -CommandMarker 'jobsimplesearch.cli web'
+$webProcess = Get-ManagedProcess -PidFile $webPidFile -CommandMarker 'simplejobsearch.cli web'
 if (-not $webProcess) {
     try {
         $existing = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$webPort/review" -TimeoutSec 2
@@ -95,7 +95,7 @@ if (-not $webProcess) {
         if ($_.Exception.Message -like '*unmanaged web process*') { throw }
     }
     $web = Start-Process -FilePath $python `
-        -ArgumentList @('-m', 'jobsimplesearch.cli', 'web') `
+        -ArgumentList @('-m', 'simplejobsearch.cli', 'web') `
         -WorkingDirectory $projectRoot `
         -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $logDir 'nicegui.out.log') `

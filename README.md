@@ -43,35 +43,35 @@ deliberately. Docker Compose overrides the path to `/app/data/jobs.db`.
 Migrations are additive:
 
 ```powershell
-jobsimplesearch migrate
+simplejobsearch migrate
 ```
 
 ## Commands
 
 ```powershell
 # NiceGUI at http://localhost:5000 (WEB_HOST/WEB_PORT are configurable)
-jobsimplesearch web
+simplejobsearch web
 
 # APScheduler foreground service (00:00 search, 08:00 reminder by default)
-jobsimplesearch scheduler
+simplejobsearch scheduler
 
 # Manual discovery/search
-jobsimplesearch search
+simplejobsearch search
 
 # Continue the latest reviewed batch
-jobsimplesearch continue
+simplejobsearch continue
 
 # Run the exact functions registered with APScheduler, on demand
-jobsimplesearch run-nightly
-jobsimplesearch run-review-reminder
+simplejobsearch run-nightly
+simplejobsearch run-review-reminder
 
 # Test each production email template without changing workflow state
-jobsimplesearch email-test search
-jobsimplesearch email-test review
-jobsimplesearch email-test complete
+simplejobsearch email-test search
+simplejobsearch email-test review
+simplejobsearch email-test complete
 ```
 
-Equivalent module commands use `python -m jobsimplesearch.cli <command>`.
+Equivalent module commands use `python -m simplejobsearch.cli <command>`.
 
 ## Public/mobile access
 
@@ -94,7 +94,7 @@ to `/results`. Each message contains both a plain-text URL and an HTML action
 button. If `PUBLIC_BASE_URL` is empty, messages are still sent without a link
 and a warning is logged.
 
-For manual ngrok testing, start `jobsimplesearch web`, then expose port 5000
+For manual ngrok testing, start `simplejobsearch web`, then expose port 5000
 with an OAuth-protected ngrok endpoint. Keep the ngrok authtoken in ngrok's own
 agent configuration, never in this repository. Set `PUBLIC_BASE_URL` only after
 the HTTPS endpoint and authentication flow work from a phone over mobile data.
@@ -102,7 +102,7 @@ the HTTPS endpoint and authentication flow work from a phone over mobile data.
 ## Windows Task Scheduler lifecycle
 
 Windows automation is opt-in. It uses Windows Task Scheduler instead of the
-long-running `jobsimplesearch scheduler` command and registers four tasks:
+long-running `simplejobsearch scheduler` command and registers four tasks:
 
 - `JobSimpleSearch-Nightly` at 22:30 searches first, starts NiceGUI/ngrok, and
   then sends the search email.

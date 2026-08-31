@@ -1,6 +1,6 @@
 """Backward-compatible NiceGUI launcher."""
 
-from jobsimplesearch.ui.app import run_web
+from simplejobsearch.ui.app import run_web
 
 
 if __name__ == "__main__":

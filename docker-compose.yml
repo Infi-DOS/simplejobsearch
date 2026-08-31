@@ -1,7 +1,7 @@
 services:
   web:
     build: .
-    command: ["jobsimplesearch", "web"]
+    command: ["simplejobsearch", "web"]
     env_file: .env
     environment:
       JOBSEARCH_DB_PATH: /app/data/jobs.db
@@ -13,7 +13,7 @@ services:
 
   scheduler:
     build: .
-    command: ["jobsimplesearch", "scheduler"]
+    command: ["simplejobsearch", "scheduler"]
     env_file: .env
     environment:
       JOBSEARCH_DB_PATH: /app/data/jobs.db

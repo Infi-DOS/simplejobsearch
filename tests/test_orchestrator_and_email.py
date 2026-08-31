@@ -5,9 +5,9 @@ import sqlite3
 from dataclasses import replace
 from html import unescape
 
-from jobsimplesearch import cli, config
-from jobsimplesearch.notifications import email
-from jobsimplesearch.pipeline import orchestrator
+from simplejobsearch import cli, config
+from simplejobsearch.notifications import email
+from simplejobsearch.pipeline import orchestrator
 
 
 def prepare_database(path):

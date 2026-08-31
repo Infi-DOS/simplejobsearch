@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from jobsimplesearch import cli
-from jobsimplesearch.notifications import diagnostics
+from simplejobsearch import cli
+from simplejobsearch.notifications import diagnostics
 
 
 @pytest.mark.parametrize(

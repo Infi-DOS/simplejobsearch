@@ -10,7 +10,7 @@ from .workflow import bootstrap_latest_batch
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="jobsimplesearch")
+    parser = argparse.ArgumentParser(prog="simplejobsearch")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("migrate", help="Apply additive database migrations")
     commands.add_parser("search", help="Run discovery and PRE_DESCRIPTION rules")

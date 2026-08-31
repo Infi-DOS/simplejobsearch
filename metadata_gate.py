@@ -10,8 +10,8 @@ from rule_engine import (
     classify_metadata_gate,
     load_metadata_rules,
 )
-from jobsimplesearch.config import get_settings
-from jobsimplesearch.db import connect as shared_connect
+from simplejobsearch.config import get_settings
+from simplejobsearch.db import connect as shared_connect
 
 
 PROJECT_DIR = Path(__file__).resolve().parent

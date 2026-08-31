@@ -14,13 +14,13 @@ from nicegui import run, ui
 
 from metadata_gate import run_all_fetched_jobs
 from post_ai_engine import run_all_extracted_jobs
-from jobsimplesearch.config import get_settings
-from jobsimplesearch.db import apply_migrations, connect as shared_connect, database
-from jobsimplesearch.pipeline.orchestrator import (
+from simplejobsearch.config import get_settings
+from simplejobsearch.db import apply_migrations, connect as shared_connect, database
+from simplejobsearch.pipeline.orchestrator import (
     PendingReviewError,
     continue_after_review,
 )
-from jobsimplesearch.workflow import bootstrap_latest_batch, mark_review_state, resolve_batch
+from simplejobsearch.workflow import bootstrap_latest_batch, mark_review_state, resolve_batch
 
 
 # =============================================================================
@@ -5186,7 +5186,7 @@ async def continue_pipeline_from_ui():
             "Starting the independent Windows pipeline worker..."
         )
         try:
-            from jobsimplesearch.windows_automation import (
+            from simplejobsearch.windows_automation import (
                 schedule_review_portal_shutdown,
                 start_pipeline_scheduled_task,
             )
@@ -5264,7 +5264,7 @@ def close_review_portal_from_ui():
         ui.notify("Windows portal automation is disabled.", type="warning")
         return
     try:
-        from jobsimplesearch.windows_automation import schedule_review_portal_shutdown
+        from simplejobsearch.windows_automation import schedule_review_portal_shutdown
 
         schedule_review_portal_shutdown()
     except Exception as exc:

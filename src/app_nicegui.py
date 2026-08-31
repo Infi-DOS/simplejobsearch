@@ -1,6 +1,6 @@
 """Installed compatibility module for the historical launcher name."""
 
-from jobsimplesearch.ui.app import build_ui, run_web
+from simplejobsearch.ui.app import build_ui, run_web
 
 __all__ = ["build_ui", "run_web"]
 

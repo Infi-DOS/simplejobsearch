@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from jobsimplesearch.pipeline import details
+from simplejobsearch.pipeline import details
 
 
 class FakeConnection:

@@ -5,7 +5,7 @@ import importlib
 import sys
 from types import SimpleNamespace
 
-from jobsimplesearch import cli, config
+from simplejobsearch import cli, config
 
 
 def test_packaged_web_entrypoint_uses_root_callable_without_import_side_effect(
@@ -19,10 +19,10 @@ def test_packaged_web_entrypoint_uses_root_callable_without_import_side_effect(
         "label",
         lambda *_args, **_kwargs: label_calls.append(True),
     )
-    sys.modules.pop("jobsimplesearch.ui.app", None)
-    sys.modules.pop("jobsimplesearch.ui.views", None)
+    sys.modules.pop("simplejobsearch.ui.app", None)
+    sys.modules.pop("simplejobsearch.ui.views", None)
 
-    web_app = importlib.import_module("jobsimplesearch.ui.app")
+    web_app = importlib.import_module("simplejobsearch.ui.app")
 
     assert label_calls == []
 
@@ -46,7 +46,7 @@ def test_packaged_web_entrypoint_uses_root_callable_without_import_side_effect(
 
 
 def test_cli_web_command_invokes_packaged_run_web(monkeypatch):
-    from jobsimplesearch.ui import app as web_app
+    from simplejobsearch.ui import app as web_app
 
     calls = []
     monkeypatch.setattr(web_app, "run_web", lambda: calls.append("web"))
@@ -56,7 +56,7 @@ def test_cli_web_command_invokes_packaged_run_web(monkeypatch):
 
 
 def test_public_paths_select_the_expected_initial_tab():
-    from jobsimplesearch.ui import views
+    from simplejobsearch.ui import views
 
     review_request = SimpleNamespace(url=SimpleNamespace(path="/review"))
     results_request = SimpleNamespace(url=SimpleNamespace(path="/results"))
@@ -69,7 +69,7 @@ def test_public_paths_select_the_expected_initial_tab():
 
 
 def test_ai_extraction_view_uses_the_explicit_client_grid(monkeypatch):
-    from jobsimplesearch.ui import views
+    from simplejobsearch.ui import views
 
     class FakeGrid:
         def __init__(self, rows):
@@ -103,7 +103,7 @@ def test_ai_extraction_view_uses_the_explicit_client_grid(monkeypatch):
 
 
 def test_review_decision_uses_the_explicit_client_grid(monkeypatch):
-    from jobsimplesearch.ui import views
+    from simplejobsearch.ui import views
 
     class FakeGrid:
         def __init__(self, rows):
@@ -136,7 +136,7 @@ def test_review_decision_uses_the_explicit_client_grid(monkeypatch):
 
 
 def test_grid_columns_follow_workflow_order():
-    from jobsimplesearch.ui import views
+    from simplejobsearch.ui import views
 
     def visible_fields(options):
         return [
@@ -227,7 +227,7 @@ def test_grid_columns_follow_workflow_order():
 
 
 def test_workflow_grids_unpin_columns_on_mobile_clients():
-    from jobsimplesearch.ui import views
+    from simplejobsearch.ui import views
 
     for options in (
         views.make_grid_options([]),

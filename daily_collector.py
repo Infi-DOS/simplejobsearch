@@ -18,9 +18,9 @@ from rule_engine import (
     load_category_defaults,
     load_pre_rules,
 )
-from jobsimplesearch.config import get_settings
-from jobsimplesearch.db import connect as shared_connect
-from jobsimplesearch.search.queries import as_legacy_searches
+from simplejobsearch.config import get_settings
+from simplejobsearch.db import connect as shared_connect
+from simplejobsearch.search.queries import as_legacy_searches
 
 
 # =============================================================================

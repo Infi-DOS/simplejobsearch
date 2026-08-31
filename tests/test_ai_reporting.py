@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from jobsimplesearch.pipeline import ai_extractor
+from simplejobsearch.pipeline import ai_extractor
 
 
 def test_ai_processed_counts_attempt_delta(monkeypatch):

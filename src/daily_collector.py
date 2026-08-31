@@ -1,4 +1,4 @@
-from jobsimplesearch._legacy import export_legacy
+from simplejobsearch._legacy import export_legacy
 
 export_legacy("daily_collector.py", globals())
 

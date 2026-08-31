@@ -15,9 +15,9 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field, ValidationError
 
-from jobsimplesearch.config import get_settings
-from jobsimplesearch.db import connect as shared_connect
-from jobsimplesearch.pipeline.retry import (
+from simplejobsearch.config import get_settings
+from simplejobsearch.db import connect as shared_connect
+from simplejobsearch.pipeline.retry import (
     is_transient_ai_error,
     retry_delay_seconds,
 )

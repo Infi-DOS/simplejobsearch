@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from jobsimplesearch.pipeline.metadata_gate import (
+from simplejobsearch.pipeline.metadata_gate import (
     METADATA_FIELDS,
     classify_metadata_gate,
     load_metadata_job,

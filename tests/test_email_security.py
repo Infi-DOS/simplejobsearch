@@ -4,8 +4,8 @@ from dataclasses import replace
 
 import pytest
 
-from jobsimplesearch import config
-from jobsimplesearch.notifications import email
+from simplejobsearch import config
+from simplejobsearch.notifications import email
 
 
 @pytest.mark.parametrize(

@@ -4,9 +4,9 @@ import sqlite3
 
 import pytest
 
-from jobsimplesearch import cli, config
-from jobsimplesearch.pipeline import orchestrator
-from jobsimplesearch.workflow import count_unfinished_ai_jobs
+from simplejobsearch import cli, config
+from simplejobsearch.pipeline import orchestrator
+from simplejobsearch.workflow import count_unfinished_ai_jobs
 
 TIMESTAMP = "2026-08-31T00:00:00+02:00"
 

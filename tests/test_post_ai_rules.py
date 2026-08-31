@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from jobsimplesearch.pipeline.post_ai import classify_post_ai, derive_ai_data_hybrid
+from simplejobsearch.pipeline.post_ai import classify_post_ai, derive_ai_data_hybrid
 
 
 def post_rule(rule_id, key, field, operator, value, action, category=None):

@@ -12,7 +12,7 @@ def load_legacy(filename: str) -> ModuleType:
     path = get_settings().project_root / filename
     if not path.exists():
         raise ImportError(f"Compatibility implementation not found: {path}")
-    name = f"_jobsimplesearch_legacy_{Path(filename).stem}"
+    name = f"_simplejobsearch_legacy_{Path(filename).stem}"
     cached = sys.modules.get(name)
     if cached is not None:
         return cached

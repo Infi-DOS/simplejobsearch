@@ -5,8 +5,8 @@ import sqlite3
 import pandas as pd
 
 import daily_collector
-from jobsimplesearch.search.queries import as_legacy_searches, sync_queries
-from jobsimplesearch.ui import views
+from simplejobsearch.search.queries import as_legacy_searches, sync_queries
+from simplejobsearch.ui import views
 
 
 def test_search_queries_include_independent_swiss_market():

@@ -3,8 +3,8 @@ from __future__ import annotations
 from io import BytesIO
 from types import SimpleNamespace
 
-from jobsimplesearch import config
-from jobsimplesearch import windows_automation
+from simplejobsearch import config
+from simplejobsearch import windows_automation
 
 
 def test_windows_automation_settings_are_opt_in(monkeypatch):

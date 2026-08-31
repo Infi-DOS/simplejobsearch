@@ -22,8 +22,8 @@ from rule_engine import (
 from metadata_gate import (
     evaluate_and_persist,
 )
-from jobsimplesearch.config import get_settings
-from jobsimplesearch.db import connect as shared_connect
+from simplejobsearch.config import get_settings
+from simplejobsearch.db import connect as shared_connect
 
 
 # =============================================================================

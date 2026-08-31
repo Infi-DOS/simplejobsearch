@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from jobsimplesearch import cli
-from jobsimplesearch.scheduler import scheduler, tasks
+from simplejobsearch import cli
+from simplejobsearch.scheduler import scheduler, tasks
 
 
 def test_run_nightly_dispatches_to_scheduler_task(monkeypatch, capsys):

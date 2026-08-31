@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 import ai_extractor as legacy
-from jobsimplesearch import config
-from jobsimplesearch.pipeline.retry import (
+from simplejobsearch import config
+from simplejobsearch.pipeline.retry import (
     is_transient_ai_error,
     retry_delay_seconds,
 )
