@@ -6,7 +6,10 @@ import pytest
 
 from simplejobsearch import cli, config
 from simplejobsearch.pipeline import orchestrator
-from simplejobsearch.workflow import count_unfinished_ai_jobs
+from simplejobsearch.workflow import (
+    count_unfinished_ai_jobs,
+    count_unfinished_pipeline_jobs,
+)
 
 TIMESTAMP = "2026-08-31T00:00:00+02:00"
 
@@ -85,6 +88,7 @@ def add_job(
     batch_id: int,
     job_id: str,
     *,
+    details: str = "FETCHED",
     metadata: str = "PASS",
     ai: str = "EXTRACTED",
     post_ai: str | None = "REJECT",
@@ -97,9 +101,9 @@ def add_job(
         INSERT INTO jobs (
             job_id, classifier_status, details_status, metadata_gate_status,
             ai_status, ai_attempt_count, post_ai_status, first_seen_at
-        ) VALUES (?, 'AUTO_KEEP', 'FETCHED', ?, ?, ?, ?, ?)
+        ) VALUES (?, 'AUTO_KEEP', ?, ?, ?, ?, ?, ?)
         """,
-        (job_id, metadata, ai, attempts, post_ai, TIMESTAMP),
+        (job_id, details, metadata, ai, attempts, post_ai, TIMESTAMP),
     )
     if attach:
         connection.execute(
@@ -165,8 +169,31 @@ def test_unfinished_eligible_job_prevents_complete(recovery_database):
         ).fetchone()
         assert row["status"] == "FAILED"
         assert row["pipeline_completed_at"] is None
-        assert "1 AI job remained unfinished after retries: failed" == row["last_error"]
+        assert "1 approved pipeline job remains unfinished: failed" == row["last_error"]
         assert count_unfinished_ai_jobs(connection, batch_id) == 1
+
+
+def test_approved_unfetched_job_prevents_complete(recovery_database):
+    path = recovery_database
+    batch_id = prepare_recovery_database(path, status="READY_TO_CONTINUE")
+    add_job(path, batch_id, "unfetched", details="NOT_FETCHED")
+    emailed = []
+
+    result = orchestrator.continue_after_review(
+        batch_date="2026-08-31",
+        details_stage=empty_stage,
+        metadata_stage=empty_stage,
+        ai_stage=empty_stage,
+        post_ai_stage=empty_stage,
+        email_sender=emailed.append,
+    )
+
+    assert result["status"] == "FAILED"
+    assert result["batch_totals"]["unfinished"] == 1
+    assert result["notification"]["status"] == "NOT_ATTEMPTED"
+    assert emailed == []
+    with orchestrator.database() as connection:
+        assert count_unfinished_pipeline_jobs(connection, batch_id) == 1
 
 
 def test_failed_resume_retries_only_unfinished_and_completes(recovery_database):

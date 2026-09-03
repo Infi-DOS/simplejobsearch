@@ -19,6 +19,7 @@ from ..workflow import (
     refresh_batch_counts,
     resolve_batch,
     unfinished_ai_job_ids,
+    unfinished_pipeline_job_ids,
     update_batch,
 )
 from .ai_extractor import run_ai_extraction
@@ -147,10 +148,11 @@ def _persisted_counts(counts: dict) -> dict[str, int]:
 
 def _unfinished_error(job_ids: list[str]) -> str:
     noun = "job" if len(job_ids) == 1 else "jobs"
+    verb = "remains" if len(job_ids) == 1 else "remain"
     displayed = ", ".join(job_ids[:10])
     if len(job_ids) > 10:
         displayed += f", and {len(job_ids) - 10} more"
-    return f"{len(job_ids)} AI {noun} remained unfinished after retries: {displayed}"
+    return f"{len(job_ids)} approved pipeline {noun} {verb} unfinished: {displayed}"
 
 
 def continue_after_review(
@@ -167,7 +169,7 @@ def continue_after_review(
     with database() as connection:
         batch = resolve_batch(connection, batch_date)
         if batch["status"] == "COMPLETE":
-            unfinished = unfinished_ai_job_ids(connection, batch["batch_id"])
+            unfinished = unfinished_pipeline_job_ids(connection, batch["batch_id"])
             if not unfinished:
                 return _pipeline_summary(
                     batch,
@@ -175,7 +177,7 @@ def continue_after_review(
                     already_complete=True,
                 )
             # Repair batches marked COMPLETE by older versions that did not
-            # enforce the terminal POST_AI invariant.
+            # enforce the complete approved-pipeline invariant.
             update_batch(
                 connection,
                 batch["batch_id"],
@@ -228,7 +230,7 @@ def continue_after_review(
 
         with database() as connection:
             counts = refresh_batch_counts(connection, batch["batch_id"])
-            unfinished = unfinished_ai_job_ids(connection, batch["batch_id"])
+            unfinished = unfinished_pipeline_job_ids(connection, batch["batch_id"])
             if unfinished:
                 last_error = _unfinished_error(unfinished)
                 update_batch(

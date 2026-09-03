@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Iterable
+from collections.abc import Callable, Iterable
 
 import details_fetcher as legacy
 
@@ -16,14 +16,15 @@ def fetch_approved_details(
     wait: Callable[[], None] | None = None,
 ) -> dict:
     """Fetch approved jobs without re-running PRE_DESCRIPTION classification."""
-    selected = set(job_ids) if job_ids is not None else None
+    selected = tuple(dict.fromkeys(job_ids)) if job_ids is not None else None
     settings = get_settings().search
     connection = connect()
     try:
-        queue = legacy.load_detail_queue(connection)
-        if selected is not None:
-            queue = [row for row in queue if row["job_id"] in selected]
-        queue = queue[: settings.details_max_jobs_per_run]
+        queue = legacy.load_detail_queue(
+            connection,
+            job_ids=selected,
+            limit=settings.details_max_jobs_per_run,
+        )
         if not queue:
             return {
                 "processed": 0, "fetched": 0, "failed": 0,
@@ -45,7 +46,7 @@ def fetch_approved_details(
                 if not description or not str(description).strip():
                     raise ValueError("LinkedIn returned no description/details")
                 legacy.save_success(connection, job["job_id"], details)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - isolate each remote fetch
                 legacy.save_failure(
                     connection,
                     job["job_id"],
@@ -67,4 +68,3 @@ def fetch_approved_details(
         return summary
     finally:
         connection.close()
-

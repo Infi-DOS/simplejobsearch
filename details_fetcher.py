@@ -290,10 +290,29 @@ def linkedin_numeric_id(
 
 def load_detail_queue(
     connection: sqlite3.Connection,
+    *,
+    job_ids=None,
+    limit: int | None = None,
 ) -> list[sqlite3.Row]:
 
+    selected_ids = tuple(dict.fromkeys(job_ids)) if job_ids is not None else None
+    if selected_ids == ():
+        return []
+
+    job_filter = ""
+    params: list[object] = [MAX_ATTEMPTS_PER_JOB]
+    if selected_ids is not None:
+        placeholders = ", ".join("?" for _ in selected_ids)
+        job_filter = f"AND j.job_id IN ({placeholders})"
+        params.extend(selected_ids)
+    resolved_limit = MAX_JOBS_PER_RUN if limit is None else limit
+    limit_clause = ""
+    if resolved_limit > 0:
+        limit_clause = "LIMIT ?"
+        params.append(resolved_limit)
+
     rows = connection.execute(
-        """
+        f"""
         SELECT
             j.job_id,
             j.site,
@@ -333,6 +352,8 @@ def load_detail_queue(
                 0
             ) < ?
 
+            {job_filter}
+
         ORDER BY
             CASE
                 WHEN j.human_decision = 'KEEP'
@@ -343,12 +364,9 @@ def load_detail_queue(
             j.first_seen_at,
             j.job_id
 
-        LIMIT ?
+        {limit_clause}
         """,
-        (
-            MAX_ATTEMPTS_PER_JOB,
-            MAX_JOBS_PER_RUN,
-        ),
+        params,
     ).fetchall()
 
     return rows

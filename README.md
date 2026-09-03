@@ -20,9 +20,12 @@ company/title grouping, run scope, group pagination, selection, KEEP, and
 EXCLUDE interaction model as Review Inbox. A manual decision overrides the PRE
 classifier while preserving that original classifier result for auditing.
 
-A batch becomes `COMPLETE` only when every batch member with fetched details and
-`metadata_gate_status=PASS` has a terminal `SHORTLIST`, `REVIEW`, or `REJECT`
-POST_AI result. Transient provider failures are retried up to
+A batch becomes `COMPLETE` only when every approved batch member has completed
+detail fetching and metadata evaluation, and every metadata pass has a terminal
+`SHORTLIST`, `REVIEW`, or `REJECT` POST_AI result. Set
+`DETAILS_MAX_JOBS_PER_RUN=0` to process all eligible jobs in one continuation;
+use a positive value only when a per-run cap is wanted. Transient provider
+failures are retried up to
 `AI_MAX_ATTEMPTS_PER_JOB` with bounded exponential backoff and jitter. Configure
 the delay bounds with `AI_RETRY_BASE_SECONDS` and `AI_RETRY_MAX_SECONDS`. If any
 eligible job remains unfinished, the batch stays `FAILED`; running `continue`
@@ -52,7 +55,7 @@ simplejobsearch migrate
 # NiceGUI at http://localhost:5000 (WEB_HOST/WEB_PORT are configurable)
 simplejobsearch web
 
-# APScheduler foreground service (00:00 search, 08:00 reminder by default)
+# APScheduler foreground service (22:30 search, 08:00 reminder)
 simplejobsearch scheduler
 
 # Manual discovery/search
@@ -117,6 +120,10 @@ The nightly and reminder workers check both the local NiceGUI endpoint and the
 configured ngrok tunnel before sending an email. A healthy existing portal is
 reused without running the startup script. If either service is unavailable,
 the worker restores the portal before sending an email containing its link.
+The 22:30 search belongs to the following morning's review date. A delayed
+nightly invocation after midnight still targets that same current review date.
+The Review page, reminder, Continue button, and continuation pipeline all use
+the batch attached to the latest successful or partial search run.
 
 Enable the handoff in `.env`:
 

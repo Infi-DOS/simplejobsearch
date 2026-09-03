@@ -3,8 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 from types import SimpleNamespace
 
-from simplejobsearch import config
-from simplejobsearch import windows_automation
+from simplejobsearch import config, windows_automation
 
 
 def test_windows_automation_settings_are_opt_in(monkeypatch):
@@ -62,6 +61,34 @@ def test_ensure_review_portal_does_not_start_a_healthy_portal(monkeypatch):
     result = windows_automation.ensure_review_portal()
 
     assert result["status"] == "ALREADY_RUNNING"
+
+
+def test_start_review_portal_uses_file_logging_without_output_pipes(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+    fake_settings = SimpleNamespace(project_root=tmp_path)
+    monkeypatch.setattr(windows_automation, "_require_windows", lambda: None)
+    monkeypatch.setattr(
+        windows_automation,
+        "_powershell_script_command",
+        lambda _name: ["powershell.exe", "Start-ReviewPortal.ps1"],
+    )
+    monkeypatch.setattr(windows_automation, "get_settings", lambda: fake_settings)
+    monkeypatch.setattr(
+        windows_automation.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append((command, kwargs)),
+    )
+
+    result = windows_automation.start_review_portal()
+
+    assert result["status"] == "STARTED"
+    assert "portal-start-worker.log" in result["message"]
+    assert "capture_output" not in calls[0][1]
+    assert calls[0][1]["stderr"] is windows_automation.subprocess.STDOUT
+    assert calls[0][1]["stdout"].name.endswith("portal-start-worker.log")
 
 
 def test_start_pipeline_scheduled_task_uses_configured_name(monkeypatch):

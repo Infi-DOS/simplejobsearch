@@ -1,9 +1,30 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import date, datetime
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from simplejobsearch import cli
 from simplejobsearch.scheduler import scheduler, tasks
+
+
+def test_nightly_batch_date_targets_the_following_morning_after_cutoff(monkeypatch):
+    monkeypatch.setattr(
+        tasks,
+        "get_settings",
+        lambda: SimpleNamespace(
+            timezone=ZoneInfo("Europe/Amsterdam"),
+            scheduler=SimpleNamespace(search_hour=22, search_minute=30),
+        ),
+    )
+
+    assert tasks.nightly_batch_date(
+        datetime(2026, 9, 2, 22, 30, tzinfo=ZoneInfo("Europe/Amsterdam"))
+    ) == date(2026, 9, 3)
+    assert tasks.nightly_batch_date(
+        datetime(2026, 9, 3, 0, 21, tzinfo=ZoneInfo("Europe/Amsterdam"))
+    ) == date(2026, 9, 3)
 
 
 def test_run_nightly_dispatches_to_scheduler_task(monkeypatch, capsys):
@@ -42,7 +63,7 @@ def test_nightly_task_is_no_op_when_todays_batch_already_ran(monkeypatch):
     monkeypatch.setattr(
         tasks,
         "get_or_create_batch",
-        lambda _connection: {"batch_id": 7, "status": "COMPLETE"},
+        lambda _connection, _batch_date: {"batch_id": 7, "status": "COMPLETE"},
     )
     monkeypatch.setattr(
         tasks,
@@ -56,7 +77,7 @@ def test_nightly_task_is_no_op_when_todays_batch_already_ran(monkeypatch):
     monkeypatch.setattr(
         tasks,
         "run_daily_search",
-        lambda: (_ for _ in ()).throw(AssertionError("Search reran")),
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("Search reran")),
     )
 
     result = tasks.nightly_search_task()
@@ -76,12 +97,15 @@ def test_nightly_email_failure_is_reported_separately(monkeypatch):
     monkeypatch.setattr(
         tasks,
         "get_or_create_batch",
-        lambda _connection: {"batch_id": 8, "status": "SEARCH_PENDING"},
+        lambda _connection, _batch_date: {
+            "batch_id": 8,
+            "status": "SEARCH_PENDING",
+        },
     )
     monkeypatch.setattr(
         tasks,
         "run_daily_search",
-        lambda: {"batch_id": 8, "status": "WAITING_FOR_REVIEW"},
+        lambda **_kwargs: {"batch_id": 8, "status": "WAITING_FOR_REVIEW"},
     )
     monkeypatch.setattr(
         tasks,
@@ -107,12 +131,15 @@ def test_nightly_task_completes_when_email_is_disabled(monkeypatch):
     monkeypatch.setattr(
         tasks,
         "get_or_create_batch",
-        lambda _connection: {"batch_id": 10, "status": "SEARCH_PENDING"},
+        lambda _connection, _batch_date: {
+            "batch_id": 10,
+            "status": "SEARCH_PENDING",
+        },
     )
     monkeypatch.setattr(
         tasks,
         "run_daily_search",
-        lambda: {"batch_id": 10, "status": "READY_TO_CONTINUE"},
+        lambda **_kwargs: {"batch_id": 10, "status": "READY_TO_CONTINUE"},
     )
     monkeypatch.setattr(tasks, "send_search_complete_email", lambda _summary: False)
 
@@ -194,7 +221,7 @@ def test_scheduler_registers_only_nightly_and_review_jobs():
     assert set(jobs) == {"daily_discovery", "review_reminder"}
     assert jobs["daily_discovery"].func is tasks.nightly_search_task
     assert jobs["review_reminder"].func is tasks.morning_review_reminder_task
-    assert "hour='0'" in str(jobs["daily_discovery"].trigger)
-    assert "minute='0'" in str(jobs["daily_discovery"].trigger)
+    assert "hour='22'" in str(jobs["daily_discovery"].trigger)
+    assert "minute='30'" in str(jobs["daily_discovery"].trigger)
     assert "hour='8'" in str(jobs["review_reminder"].trigger)
     assert "minute='0'" in str(jobs["review_reminder"].trigger)

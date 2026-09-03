@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
 import json
 import logging
 import os
-from pathlib import Path
 import subprocess
+from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
 
@@ -48,17 +48,23 @@ def _powershell_script_command(name: str, *arguments: str) -> list[str]:
 def start_review_portal() -> dict[str, Any]:
     """Start NiceGUI and ngrok and wait until their local health checks pass."""
     _require_windows()
-    completed = subprocess.run(
-        _powershell_script_command("Start-ReviewPortal.ps1"),
-        cwd=get_settings().project_root,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
+    settings = get_settings()
+    log_dir = settings.project_root / "data" / "windows-runtime" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    startup_log = log_dir / "portal-start-worker.log"
+    with startup_log.open("a", encoding="utf-8") as log_file:
+        subprocess.run(
+            _powershell_script_command("Start-ReviewPortal.ps1"),
+            cwd=settings.project_root,
+            check=True,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=90,
+        )
     return {
         "status": "STARTED",
-        "message": completed.stdout.strip() or "Review portal is ready.",
+        "message": f"Review portal is ready. Startup log: {startup_log}",
     }
 
 

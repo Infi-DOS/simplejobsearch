@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
 import logging
+from collections.abc import Callable, Mapping
+from datetime import date, datetime, timedelta
 from typing import Any
 
+from ..config import get_settings
 from ..db import apply_migrations, database
 from ..notifications.email import (
     deliver_notification,
@@ -22,13 +24,28 @@ from ..workflow import (
 LOGGER = logging.getLogger(__name__)
 
 
+def nightly_batch_date(now: datetime | None = None) -> date:
+    """Return the morning review date owned by this nightly invocation."""
+    settings = get_settings()
+    local_now = now or datetime.now(settings.timezone)
+    scheduled_at = (
+        settings.scheduler.search_hour,
+        settings.scheduler.search_minute,
+    )
+    if (local_now.hour, local_now.minute) >= scheduled_at:
+        return local_now.date() + timedelta(days=1)
+    return local_now.date()
+
+
 def nightly_search_task(
     *,
     email_sender: Callable[[Mapping[str, Any]], bool] | None = None,
+    batch_date: date | str | None = None,
 ) -> dict:
     apply_migrations()
+    target_batch_date = nightly_batch_date() if batch_date is None else batch_date
     with database() as connection:
-        batch = get_or_create_batch(connection)
+        batch = get_or_create_batch(connection, target_batch_date)
         if batch["status"] not in {"SEARCH_PENDING", "FAILED"}:
             summary = batch_summary(connection, batch["batch_id"])
             summary.update(
@@ -49,7 +66,7 @@ def nightly_search_task(
             )
             return summary
 
-    summary = run_daily_search()
+    summary = run_daily_search(batch_date=target_batch_date)
     summary["task"] = "nightly_search"
     summary["task_status"] = "COMPLETED"
     summary["reason"] = None

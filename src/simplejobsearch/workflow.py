@@ -51,6 +51,29 @@ def latest_batch(connection: sqlite3.Connection) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def latest_run_batch(connection: sqlite3.Connection) -> sqlite3.Row | None:
+    """Return the workflow batch attached to the latest reviewable search run."""
+    search_run_columns = {
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in connection.execute("PRAGMA table_info(search_runs)")
+    }
+    status_filter = (
+        "WHERE sr.status IN ('SUCCESS', 'PARTIAL')"
+        if "status" in search_run_columns
+        else ""
+    )
+    return connection.execute(
+        f"""
+        SELECT db.*
+        FROM daily_batches db
+        JOIN search_runs sr ON sr.run_id = db.search_run_id
+        {status_filter}
+        ORDER BY sr.started_at DESC, db.batch_id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
 def resolve_batch(
     connection: sqlite3.Connection,
     batch_date: date | str | None = None,
@@ -63,11 +86,7 @@ def resolve_batch(
         if row is None:
             raise LookupError(f"No daily batch exists for {batch_date_value(batch_date)}")
         return row
-    today = connection.execute(
-        "SELECT * FROM daily_batches WHERE batch_date = ?",
-        (batch_date_value(),),
-    ).fetchone()
-    row = today or latest_batch(connection)
+    row = latest_run_batch(connection) or latest_batch(connection)
     if row is None:
         raise LookupError("No daily batch exists; run a search first")
     return row
@@ -186,7 +205,7 @@ def refresh_batch_counts(connection: sqlite3.Connection, batch_id: int) -> dict[
     )
     counts = {key: int(row[key] or 0) for key in keys}
     counts["ai_failed_count"] = count_failed_ai_jobs(connection, batch_id)
-    counts["unfinished_count"] = count_unfinished_ai_jobs(connection, batch_id)
+    counts["unfinished_count"] = count_unfinished_pipeline_jobs(connection, batch_id)
     return counts
 
 
@@ -221,6 +240,54 @@ def unfinished_ai_job_ids(
 def count_unfinished_ai_jobs(connection: sqlite3.Connection, batch_id: int) -> int:
     """Count unfinished AI-eligible jobs using daily-batch membership."""
     return len(unfinished_ai_job_ids(connection, batch_id))
+
+
+def unfinished_pipeline_job_ids(
+    connection: sqlite3.Connection,
+    batch_id: int,
+) -> list[str]:
+    """Return approved batch jobs that have not reached a terminal outcome."""
+    placeholders = ", ".join("?" for _ in TERMINAL_POST_AI_STATUSES)
+    return [
+        row[0]
+        for row in connection.execute(
+            f"""
+            SELECT b.job_id
+            FROM daily_batch_jobs b
+            JOIN jobs j ON j.job_id = b.job_id
+            WHERE b.batch_id = ?
+              AND (
+                    UPPER(TRIM(COALESCE(j.human_decision, ''))) = 'KEEP'
+                    OR (
+                        TRIM(COALESCE(j.human_decision, '')) = ''
+                        AND j.classifier_status = 'AUTO_KEEP'
+                    )
+              )
+              AND (
+                    UPPER(TRIM(COALESCE(j.details_status, ''))) <> 'FETCHED'
+                    OR UPPER(TRIM(COALESCE(j.metadata_gate_status, '')))
+                       NOT IN ('PASS', 'REJECT')
+                    OR (
+                        UPPER(TRIM(COALESCE(j.metadata_gate_status, ''))) = 'PASS'
+                        AND (
+                            j.post_ai_status IS NULL
+                            OR TRIM(j.post_ai_status) = ''
+                            OR j.post_ai_status NOT IN ({placeholders})
+                        )
+                    )
+              )
+            ORDER BY b.observed_at, b.job_id
+            """,
+            (batch_id, *TERMINAL_POST_AI_STATUSES),
+        )
+    ]
+
+
+def count_unfinished_pipeline_jobs(
+    connection: sqlite3.Connection,
+    batch_id: int,
+) -> int:
+    return len(unfinished_pipeline_job_ids(connection, batch_id))
 
 
 def count_failed_ai_jobs(connection: sqlite3.Connection, batch_id: int) -> int:

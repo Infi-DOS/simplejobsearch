@@ -59,6 +59,14 @@ def test_orchestrator_calls_stages_in_order(tmp_path, monkeypatch):
             "INSERT INTO daily_batch_jobs VALUES (?, 'li-1', 1, ?)",
             (batch_id, timestamp),
         )
+        connection.execute(
+            """
+            UPDATE jobs
+            SET details_status='FETCHED', metadata_gate_status='PASS',
+                ai_status='EXTRACTED', post_ai_status='REVIEW'
+            WHERE job_id='li-1'
+            """
+        )
         connection.commit()
 
     order = []
@@ -83,7 +91,7 @@ def test_orchestrator_calls_stages_in_order(tmp_path, monkeypatch):
     assert result["already_complete"] is False
     assert result["no_op"] is False
     assert result["this_run"]["ai_processed"] == 0
-    assert result["batch_totals"]["ai_extracted"] == 0
+    assert result["batch_totals"]["ai_extracted"] == 1
     with orchestrator.database() as connection:
         assert connection.execute("SELECT status FROM daily_batches").fetchone()[0] == "COMPLETE"
     config.reset_settings_cache()
@@ -262,6 +270,14 @@ def test_completed_batch_is_idempotent(tmp_path, monkeypatch, capsys):
             "INSERT INTO daily_batch_jobs VALUES (?, 'li-1', 1, ?)",
             (batch_id, timestamp),
         )
+        connection.execute(
+            """
+            UPDATE jobs
+            SET details_status='FETCHED', metadata_gate_status='PASS',
+                ai_status='EXTRACTED', post_ai_status='REVIEW'
+            WHERE job_id='li-1'
+            """
+        )
         connection.commit()
 
     def must_not_run(**_kwargs):
@@ -418,6 +434,14 @@ def test_pipeline_email_failure_does_not_change_completed_batch(tmp_path, monkey
         connection.execute(
             "INSERT INTO daily_batch_jobs VALUES (?, 'li-1', 1, ?)",
             (batch_id, timestamp),
+        )
+        connection.execute(
+            """
+            UPDATE jobs
+            SET details_status='FETCHED', metadata_gate_status='PASS',
+                ai_status='EXTRACTED', post_ai_status='REVIEW'
+            WHERE job_id='li-1'
+            """
         )
         connection.commit()
 
