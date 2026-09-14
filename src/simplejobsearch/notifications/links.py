@@ -14,4 +14,18 @@ def review_url(public_base_url: str | None) -> str | None:
 
 
 def results_url(public_base_url: str | None) -> str | None:
+    """Legacy link for bookmarks and already-sent messages."""
     return public_url(public_base_url, "/results")
+
+
+def final_review_url(public_base_url: str | None) -> str | None:
+    """Legacy link for bookmarks and already-sent messages."""
+    return public_url(public_base_url, "/final-review")
+
+
+def post_ai_review_url(public_base_url: str | None) -> str | None:
+    return public_url(public_base_url, "/post-ai-review")
+
+
+def recommended_jobs_url(public_base_url: str | None) -> str | None:
+    return public_url(public_base_url, "/recommended-jobs")

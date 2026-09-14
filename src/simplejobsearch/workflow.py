@@ -9,6 +9,7 @@ from .db import scalar
 from .search.queries import sync_queries
 
 TERMINAL_POST_AI_STATUSES = ("SHORTLIST", "REVIEW", "REJECT")
+FINAL_DECISIONS = ("ACCEPTED", "REJECTED")
 
 
 def now_local() -> datetime:
@@ -102,6 +103,9 @@ def update_batch(connection: sqlite3.Connection, batch_id: int, **values: Any) -
         "new_job_count", "review_required_count", "details_fetched_count",
         "metadata_pass_count", "metadata_reject_count", "ai_processed_count",
         "shortlist_count", "final_review_count", "reject_count", "last_error",
+        "final_review_status", "final_review_started_at",
+        "final_review_completed_at", "final_pending_count",
+        "final_accepted_count", "final_rejected_count",
         "updated_at",
     }
     unknown = set(values) - allowed
@@ -191,7 +195,14 @@ def refresh_batch_counts(connection: sqlite3.Connection, batch_id: int) -> dict[
             SUM(CASE WHEN j.ai_status = 'EXTRACTED' THEN 1 ELSE 0 END) AS ai_processed_count,
             SUM(CASE WHEN j.post_ai_status = 'SHORTLIST' THEN 1 ELSE 0 END) AS shortlist_count,
             SUM(CASE WHEN j.post_ai_status = 'REVIEW' THEN 1 ELSE 0 END) AS final_review_count,
-            SUM(CASE WHEN j.post_ai_status = 'REJECT' THEN 1 ELSE 0 END) AS reject_count
+            SUM(CASE WHEN j.post_ai_status = 'REJECT' THEN 1 ELSE 0 END) AS reject_count,
+            SUM(CASE WHEN j.post_ai_status IN ('SHORTLIST', 'REVIEW', 'REJECT')
+                      AND (j.final_decision IS NULL OR TRIM(j.final_decision) = '')
+                     THEN 1 ELSE 0 END) AS final_pending_count,
+            SUM(CASE WHEN j.final_decision = 'ACCEPTED' THEN 1 ELSE 0 END)
+                AS final_accepted_count,
+            SUM(CASE WHEN j.final_decision = 'REJECTED' THEN 1 ELSE 0 END)
+                AS final_rejected_count
         FROM daily_batch_jobs b
         JOIN jobs j ON j.job_id = b.job_id
         WHERE b.batch_id = ?
@@ -202,6 +213,7 @@ def refresh_batch_counts(connection: sqlite3.Connection, batch_id: int) -> dict[
         "new_job_count", "review_required_count", "details_fetched_count",
         "metadata_pass_count", "metadata_reject_count", "ai_processed_count",
         "shortlist_count", "final_review_count", "reject_count",
+        "final_pending_count", "final_accepted_count", "final_rejected_count",
     )
     counts = {key: int(row[key] or 0) for key in keys}
     counts["ai_failed_count"] = count_failed_ai_jobs(connection, batch_id)
@@ -290,6 +302,175 @@ def count_unfinished_pipeline_jobs(
     return len(unfinished_pipeline_job_ids(connection, batch_id))
 
 
+def final_review_counts(
+    connection: sqlite3.Connection,
+    batch_id: int,
+) -> dict[str, int]:
+    row = connection.execute(
+        """
+        SELECT
+            SUM(CASE WHEN j.post_ai_status IN ('SHORTLIST', 'REVIEW', 'REJECT')
+                      AND (j.final_decision IS NULL OR TRIM(j.final_decision) = '')
+                     THEN 1 ELSE 0 END) AS pending,
+            SUM(CASE WHEN j.final_decision = 'ACCEPTED' THEN 1 ELSE 0 END) AS accepted,
+            SUM(CASE WHEN j.final_decision = 'REJECTED' THEN 1 ELSE 0 END) AS rejected
+        FROM daily_batch_jobs b
+        JOIN jobs j ON j.job_id = b.job_id
+        WHERE b.batch_id = ?
+        """,
+        (batch_id,),
+    ).fetchone()
+    return {
+        "pending": int(row["pending"] or 0),
+        "accepted": int(row["accepted"] or 0),
+        "rejected": int(row["rejected"] or 0),
+    }
+
+
+def refresh_final_review_state(
+    connection: sqlite3.Connection,
+    batch_id: int,
+) -> dict[str, Any]:
+    counts = final_review_counts(connection, batch_id)
+    current = connection.execute(
+        """
+        SELECT status, final_review_started_at, final_review_completed_at
+        FROM daily_batches
+        WHERE batch_id = ?
+        """,
+        (batch_id,),
+    ).fetchone()
+    if current is None:
+        raise LookupError(f"Unknown daily batch: {batch_id}")
+    if current["status"] != "COMPLETE":
+        update_batch(
+            connection,
+            batch_id,
+            final_review_status="NOT_STARTED",
+            final_review_started_at=None,
+            final_review_completed_at=None,
+            final_pending_count=counts["pending"],
+            final_accepted_count=counts["accepted"],
+            final_rejected_count=counts["rejected"],
+        )
+        return {**counts, "status": "NOT_STARTED"}
+    timestamp = now_iso()
+    pending = counts["pending"]
+    status = "AWAITING_REVIEW" if pending else "FINALIZED"
+    update_batch(
+        connection,
+        batch_id,
+        final_review_status=status,
+        final_review_started_at=current["final_review_started_at"] or timestamp,
+        final_review_completed_at=(
+            None
+            if pending
+            else current["final_review_completed_at"] or timestamp
+        ),
+        final_pending_count=pending,
+        final_accepted_count=counts["accepted"],
+        final_rejected_count=counts["rejected"],
+    )
+    return {**counts, "status": status}
+
+
+def refresh_all_final_review_states(
+    connection: sqlite3.Connection,
+) -> dict[str, int]:
+    states = {"NOT_STARTED": 0, "AWAITING_REVIEW": 0, "FINALIZED": 0}
+    batch_ids = [
+        row[0]
+        for row in connection.execute(
+            "SELECT batch_id FROM daily_batches ORDER BY batch_id"
+        )
+    ]
+    for batch_id in batch_ids:
+        state = refresh_final_review_state(connection, batch_id)
+        states[state["status"]] += 1
+    return states
+
+
+def set_final_decisions(
+    connection: sqlite3.Connection,
+    batch_id: int,
+    job_ids: list[str],
+    decision: str,
+    *,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    normalized = decision.strip().upper()
+    if normalized not in FINAL_DECISIONS:
+        raise ValueError(f"Final decision must be one of: {', '.join(FINAL_DECISIONS)}")
+    selected = list(dict.fromkeys(job_ids))
+    if not selected:
+        state = refresh_final_review_state(connection, batch_id)
+        return {"requested": 0, "saved": 0, **state}
+
+    placeholders = ", ".join("?" for _ in selected)
+    eligible = connection.execute(
+        f"""
+        SELECT j.job_id, j.final_decision, j.final_notes
+        FROM daily_batch_jobs b
+        JOIN jobs j ON j.job_id = b.job_id
+        JOIN daily_batches d ON d.batch_id = b.batch_id
+        WHERE b.batch_id = ?
+          AND d.status = 'COMPLETE'
+          AND j.job_id IN ({placeholders})
+          AND (
+                j.post_ai_status IN ('SHORTLIST', 'REVIEW', 'REJECT')
+                OR j.final_decision IN ('ACCEPTED', 'REJECTED')
+          )
+        """,
+        (batch_id, *selected),
+    ).fetchall()
+    timestamp = now_iso()
+    changed_ids = [
+        row["job_id"]
+        for row in eligible
+        if row["final_decision"] != normalized
+        or (notes is not None and (row["final_notes"] or "") != notes)
+    ]
+    if changed_ids:
+        changed_placeholders = ", ".join("?" for _ in changed_ids)
+        connection.execute(
+            f"""
+            UPDATE jobs
+            SET final_decision = ?,
+                final_decided_at = ?,
+                final_notes = CASE WHEN ? IS NULL THEN final_notes ELSE ? END
+            WHERE job_id IN ({changed_placeholders})
+            """,
+            (normalized, timestamp, notes, notes, *changed_ids),
+        )
+        connection.commit()
+        affected_batch_ids = [
+            row[0]
+            for row in connection.execute(
+                f"""
+                SELECT DISTINCT batch_id
+                FROM daily_batch_jobs
+                WHERE job_id IN ({changed_placeholders})
+                """,
+                changed_ids,
+            )
+        ]
+        for affected_batch_id in affected_batch_ids:
+            refresh_final_review_state(connection, affected_batch_id)
+            run_id = connection.execute(
+                "SELECT search_run_id FROM daily_batches WHERE batch_id = ?",
+                (affected_batch_id,),
+            ).fetchone()[0]
+            if run_id:
+                record_query_metrics(connection, run_id)
+    state = refresh_final_review_state(connection, batch_id)
+    return {
+        "requested": len(selected),
+        "eligible": len(eligible),
+        "saved": len(changed_ids),
+        **state,
+    }
+
+
 def count_failed_ai_jobs(connection: sqlite3.Connection, batch_id: int) -> int:
     """Count unfinished eligible jobs whose latest AI attempt failed."""
     placeholders = ", ".join("?" for _ in TERMINAL_POST_AI_STATUSES)
@@ -332,6 +513,50 @@ def mark_review_state(connection: sqlite3.Connection, batch_id: int) -> int:
     return pending
 
 
+def reconcile_batch_summaries(connection: sqlite3.Connection) -> list[dict]:
+    """Refresh derived batch state from jobs without fetching or deciding jobs."""
+    refreshed = []
+    batches = connection.execute("SELECT * FROM daily_batches ORDER BY batch_id").fetchall()
+    for batch in batches:
+        if batch["status"] in {"SEARCH_PENDING", "SEARCHING", "PROCESSING"}:
+            continue
+        if (batch["status"] == "FAILED" and not batch["search_run_id"]
+                and not batch["pipeline_started_at"]):
+            # A discovery failure is not a reviewed batch ready for continuation.
+            continue
+        batch_id = batch["batch_id"]
+        counts = refresh_batch_counts(connection, batch_id)
+        pending = pending_review_count(connection, batch_id)
+        unfinished = unfinished_pipeline_job_ids(connection, batch_id)
+        if pending:
+            status = "WAITING_FOR_REVIEW"
+        elif unfinished:
+            status = "FAILED" if batch["pipeline_started_at"] else "READY_TO_CONTINUE"
+        else:
+            status = "COMPLETE" if batch["pipeline_started_at"] else "READY_TO_CONTINUE"
+        values = {key: value for key, value in counts.items() if key not in {
+            "ai_failed_count", "unfinished_count",
+        }}
+        values.update(
+            status=status,
+            review_required_count=pending,
+            review_completed_at=None if pending else (batch["review_completed_at"] or now_iso()),
+            pipeline_completed_at=(batch["pipeline_completed_at"] or now_iso())
+            if status == "COMPLETE" else None,
+            last_error=f"{len(unfinished)} approved pipeline jobs remain unfinished"
+            if status == "FAILED" else None,
+        )
+        update_batch(connection, batch_id, **values)
+        refresh_final_review_state(connection, batch_id)
+        if batch["search_run_id"]:
+            record_query_metrics(connection, batch["search_run_id"])
+        refreshed.append({
+            "batch_id": batch_id, "batch_date": batch["batch_date"], "status": status,
+            "pending_title_reviews": pending, "unfinished": len(unfinished),
+        })
+    return refreshed
+
+
 def record_query_metrics(connection: sqlite3.Connection, run_id: str) -> None:
     timestamp = now_iso()
     sync_queries(connection, timestamp)
@@ -347,7 +572,8 @@ def record_query_metrics(connection: sqlite3.Connection, run_id: str) -> None:
             run_id, query_key, hits, unique_jobs, new_jobs,
             auto_keep, review, auto_exclude,
             metadata_pass, metadata_reject,
-            final_shortlist, final_review, final_reject, updated_at
+            final_shortlist, final_review, final_reject,
+            human_final_accepted, human_final_rejected, updated_at
         )
         SELECT h.run_id, h.search_name,
                COUNT(*), COUNT(DISTINCT h.job_id),
@@ -360,6 +586,8 @@ def record_query_metrics(connection: sqlite3.Connection, run_id: str) -> None:
                COUNT(DISTINCT CASE WHEN j.post_ai_status = 'SHORTLIST' THEN h.job_id END),
                COUNT(DISTINCT CASE WHEN j.post_ai_status = 'REVIEW' THEN h.job_id END),
                COUNT(DISTINCT CASE WHEN j.post_ai_status = 'REJECT' THEN h.job_id END),
+               COUNT(DISTINCT CASE WHEN j.final_decision = 'ACCEPTED' THEN h.job_id END),
+               COUNT(DISTINCT CASE WHEN j.final_decision = 'REJECTED' THEN h.job_id END),
                ?
         FROM search_hits h
         JOIN jobs j ON j.job_id = h.job_id
@@ -371,7 +599,10 @@ def record_query_metrics(connection: sqlite3.Connection, run_id: str) -> None:
             auto_keep=excluded.auto_keep, review=excluded.review, auto_exclude=excluded.auto_exclude,
             metadata_pass=excluded.metadata_pass, metadata_reject=excluded.metadata_reject,
             final_shortlist=excluded.final_shortlist, final_review=excluded.final_review,
-            final_reject=excluded.final_reject, updated_at=excluded.updated_at
+            final_reject=excluded.final_reject,
+            human_final_accepted=excluded.human_final_accepted,
+            human_final_rejected=excluded.human_final_rejected,
+            updated_at=excluded.updated_at
         """,
         (run[0], run[1], timestamp, run_id),
     )

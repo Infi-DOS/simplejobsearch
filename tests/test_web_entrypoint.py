@@ -60,10 +60,20 @@ def test_public_paths_select_the_expected_initial_tab():
 
     review_request = SimpleNamespace(url=SimpleNamespace(path="/review"))
     results_request = SimpleNamespace(url=SimpleNamespace(path="/results"))
+    final_review_request = SimpleNamespace(url=SimpleNamespace(path="/final-review"))
+    post_ai_review_request = SimpleNamespace(
+        url=SimpleNamespace(path="/post-ai-review")
+    )
+    recommended_jobs_request = SimpleNamespace(
+        url=SimpleNamespace(path="/recommended-jobs")
+    )
     root_request = SimpleNamespace(url=SimpleNamespace(path="/"))
 
     assert views._initial_ui_view(review_request) == "review"
-    assert views._initial_ui_view(results_request) == "results"
+    assert views._initial_ui_view(results_request) == "post_ai_review"
+    assert views._initial_ui_view(final_review_request) == "post_ai_review"
+    assert views._initial_ui_view(post_ai_review_request) == "post_ai_review"
+    assert views._initial_ui_view(recommended_jobs_request) == "recommended_jobs"
     assert views._initial_ui_view(root_request) == "review"
     assert views._initial_ui_view(None) == "review"
 
@@ -204,6 +214,21 @@ def test_grid_columns_follow_workflow_order():
         "ai_languages_bonus_display",
         "ai_extraction_confidence",
     ]
+    assert visible_fields(views.final_review_grid_options([])) == [
+        "post_ai_status",
+        "post_ai_reason_display",
+        "post_ai_review_category_display",
+        "human_decision_display",
+        "title",
+        "company",
+        "location",
+        "ai_role_family",
+        "ai_seniority",
+        "ai_minimum_years_experience",
+        "ai_languages_display",
+        "ai_role_families_display",
+        "final_decided_at",
+    ]
     assert visible_fields(views.category_grid_options([])) == [
         "enabled",
         "sort_order",
@@ -226,6 +251,21 @@ def test_grid_columns_follow_workflow_order():
     ]
 
 
+def test_recommended_jobs_loader_uses_only_human_kept_rows(monkeypatch):
+    from simplejobsearch.ui import views
+
+    calls = []
+    expected = [{"job_id": "kept"}]
+    monkeypatch.setattr(
+        views,
+        "load_final_review_jobs",
+        lambda decision, scope: calls.append((decision, scope)) or expected,
+    )
+
+    assert views.load_recommended_jobs("All recommended jobs") == expected
+    assert calls == [("ACCEPTED", "All recommended jobs")]
+
+
 def test_workflow_grids_unpin_columns_on_mobile_clients():
     from simplejobsearch.ui import views
 
@@ -234,6 +274,7 @@ def test_workflow_grids_unpin_columns_on_mobile_clients():
         views.prefetch_grid_options([]),
         views.fetched_grid_options([]),
         views.ai_extracted_grid_options([]),
+        views.final_review_grid_options([]),
     ):
         assert "max-width: 700px" in options[":onGridReady"]
         assert "pinned: null" in options[":onGridReady"]

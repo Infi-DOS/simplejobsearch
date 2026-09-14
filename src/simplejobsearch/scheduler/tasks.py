@@ -13,6 +13,7 @@ from ..notifications.email import (
     send_review_reminder_email,
     send_search_complete_email,
 )
+from ..operations import recorded_task, task_lock
 from ..search.collector import run_daily_search
 from ..workflow import (
     batch_summary,
@@ -37,6 +38,7 @@ def nightly_batch_date(now: datetime | None = None) -> date:
     return local_now.date()
 
 
+@recorded_task("nightly_search")
 def nightly_search_task(
     *,
     email_sender: Callable[[Mapping[str, Any]], bool] | None = None,
@@ -46,7 +48,26 @@ def nightly_search_task(
     target_batch_date = nightly_batch_date() if batch_date is None else batch_date
     with database() as connection:
         batch = get_or_create_batch(connection, target_batch_date)
-        if batch["status"] not in {"SEARCH_PENDING", "FAILED"}:
+        abandoned_search = False
+        if batch["status"] == "SEARCHING":
+            with task_lock("discovery") as acquired:
+                abandoned_search = acquired
+            if not abandoned_search:
+                return {
+                    "batch_id": batch["batch_id"], "status": "BUSY",
+                    "task_status": "NO_OP", "reason": "discovery_already_running",
+                }
+        # A failed continuation must never cause discovery to replace a reviewed batch.
+        finished_search = False
+        run_id = dict(batch).get("search_run_id")
+        if run_id and batch["status"] == "FAILED":
+            run = connection.execute(
+                "SELECT status FROM search_runs WHERE run_id=?", (run_id,),
+            ).fetchone()
+            finished_search = bool(run and run[0] in {"SUCCESS", "PARTIAL"})
+        if finished_search or (
+            not abandoned_search and batch["status"] not in {"SEARCH_PENDING", "FAILED"}
+        ):
             summary = batch_summary(connection, batch["batch_id"])
             summary.update(
                 {
@@ -68,6 +89,10 @@ def nightly_search_task(
 
     summary = run_daily_search(batch_date=target_batch_date)
     summary["task"] = "nightly_search"
+    if summary.get("status") == "BUSY":
+        # A direct discovery invocation may acquire the lock after our state check.
+        summary["task_status"] = "NO_OP"
+        return summary
     summary["task_status"] = "COMPLETED"
     summary["reason"] = None
     summary["notification"] = deliver_notification(
@@ -78,6 +103,7 @@ def nightly_search_task(
     return summary
 
 
+@recorded_task("review_reminder")
 def morning_review_reminder_task(
     *,
     email_sender: Callable[[Mapping[str, Any]], bool] | None = None,

@@ -9,7 +9,44 @@ from simplejobsearch.pipeline import orchestrator
 from simplejobsearch.workflow import (
     count_unfinished_ai_jobs,
     count_unfinished_pipeline_jobs,
+    reconcile_batch_summaries,
 )
+
+
+def test_reconcile_repairs_stale_title_review_summary(recovery_database):
+    path = recovery_database
+    batch_id = prepare_recovery_database(path, status="WAITING_FOR_REVIEW")
+    add_job(path, batch_id, "approved", details="NOT_FETCHED", metadata=None, ai=None, post_ai=None)
+    with orchestrator.database() as connection:
+        connection.execute("UPDATE daily_batches SET review_required_count=253")
+        connection.commit()
+        result = reconcile_batch_summaries(connection)
+        row = connection.execute("SELECT status,review_required_count FROM daily_batches").fetchone()
+        assert tuple(row) == ("READY_TO_CONTINUE", 0)
+        assert result[0]["unfinished"] == 1
+        assert connection.execute("SELECT ai_attempt_count FROM jobs").fetchone()[0] == 1
+
+
+def test_reconcile_finishes_batch_only_when_all_approved_jobs_are_terminal(recovery_database):
+    path = recovery_database
+    batch_id = prepare_recovery_database(path, status="FAILED")
+    add_job(path, batch_id, "done", post_ai="SHORTLIST")
+    with orchestrator.database() as connection:
+        reconcile_batch_summaries(connection)
+        row = connection.execute("SELECT status,ai_processed_count,final_pending_count,last_error FROM daily_batches").fetchone()
+        assert tuple(row) == ("COMPLETE", 1, 1, None)
+
+
+def test_reconcile_preserves_failure_before_discovery_finished(recovery_database):
+    prepare_recovery_database(recovery_database, status="FAILED")
+    with orchestrator.database() as connection:
+        connection.execute(
+            "UPDATE daily_batches SET pipeline_started_at=NULL,last_error='search failed'"
+        )
+        connection.commit()
+        assert reconcile_batch_summaries(connection) == []
+        row = connection.execute("SELECT status,last_error FROM daily_batches").fetchone()
+        assert tuple(row) == ("FAILED", "search failed")
 
 TIMESTAMP = "2026-08-31T00:00:00+02:00"
 
@@ -28,6 +65,9 @@ def prepare_recovery_database(path, *, status: str) -> int:
             ai_attempt_count INTEGER NOT NULL DEFAULT 0,
             ai_last_error TEXT,
             post_ai_status TEXT,
+            final_decision TEXT,
+            final_decided_at TEXT,
+            final_notes TEXT,
             first_seen_at TEXT
         );
         CREATE TABLE daily_batches (
@@ -49,6 +89,12 @@ def prepare_recovery_database(path, *, status: str) -> int:
             shortlist_count INTEGER NOT NULL DEFAULT 0,
             final_review_count INTEGER NOT NULL DEFAULT 0,
             reject_count INTEGER NOT NULL DEFAULT 0,
+            final_review_status TEXT NOT NULL DEFAULT 'NOT_STARTED',
+            final_review_started_at TEXT,
+            final_review_completed_at TEXT,
+            final_pending_count INTEGER NOT NULL DEFAULT 0,
+            final_accepted_count INTEGER NOT NULL DEFAULT 0,
+            final_rejected_count INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL

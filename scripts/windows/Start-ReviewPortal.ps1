@@ -46,7 +46,7 @@ function Wait-LocalWeb {
     $deadline = (Get-Date).AddSeconds(60)
     do {
         try {
-            $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/review" -TimeoutSec 3
+            $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/review" -TimeoutSec 10
             if ($response.StatusCode -eq 200) { return }
         } catch {
             Start-Sleep -Milliseconds 500
@@ -87,7 +87,7 @@ if (-not $publicBaseUrl) {
 $webProcess = Get-ManagedProcess -PidFile $webPidFile -CommandMarker 'simplejobsearch.cli web'
 if (-not $webProcess) {
     try {
-        $existing = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$webPort/review" -TimeoutSec 2
+        $existing = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$webPort/review" -TimeoutSec 10
         if ($existing.StatusCode -eq 200) {
             throw "Port $webPort already has an unmanaged web process. Stop it before using Windows automation."
         }

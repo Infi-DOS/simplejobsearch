@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
-from typing import Any, Callable
+from typing import Any
 
 from ..db import apply_migrations, database
+from ..operations import recorded_task
 from ..workflow import (
     attach_search_run,
     batch_summary,
@@ -15,6 +17,7 @@ from ..workflow import (
 from .queries import sync_queries
 
 
+@recorded_task("discovery")
 def run_daily_search(
     *,
     batch_date: date | str | None = None,
@@ -35,6 +38,7 @@ def run_daily_search(
 
     if collector is None:
         import daily_collector as legacy_collector
+
         from .queries import as_legacy_searches
 
         legacy_collector.SEARCHES = as_legacy_searches()

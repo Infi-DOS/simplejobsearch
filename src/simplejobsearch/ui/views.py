@@ -6,7 +6,6 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 from fastapi import Request
@@ -15,12 +14,19 @@ from nicegui import run, ui
 from metadata_gate import run_all_fetched_jobs
 from post_ai_engine import run_all_extracted_jobs
 from simplejobsearch.config import get_settings
-from simplejobsearch.db import apply_migrations, connect as shared_connect, database
+from simplejobsearch.db import apply_migrations, database
+from simplejobsearch.db import connect as shared_connect
 from simplejobsearch.pipeline.orchestrator import (
     PendingReviewError,
     continue_after_review,
 )
-from simplejobsearch.workflow import bootstrap_latest_batch, mark_review_state, resolve_batch
+from simplejobsearch.workflow import (
+    bootstrap_latest_batch,
+    mark_review_state,
+    refresh_all_final_review_states,
+    resolve_batch,
+    set_final_decisions,
+)
 
 
 # =============================================================================
@@ -41,6 +47,16 @@ SCOPE_OPTIONS = [
 PREFETCH_SCOPE_OPTIONS = [
     "Latest run",
     "All pre-fetch",
+]
+
+POST_AI_REVIEW_SCOPE_OPTIONS = [
+    "Latest run",
+    "All Post-AI review",
+]
+
+RECOMMENDED_JOBS_SCOPE_OPTIONS = [
+    "Latest run",
+    "All recommended jobs",
 ]
 
 PREFETCH_VIEW_LABELS = {
@@ -207,13 +223,15 @@ fetched_metadata_pass_label = None
 fetched_metadata_reject_label = None
 fetched_ai_pending_label = None
 
-# Post-AI Extraction UI references
+# Post-AI Review and Recommended Jobs UI references
 ai_extracted_grid = None
 ai_extracted_count_label = None
 ai_shortlist_count_label = None
 ai_review_count_label = None
 ai_reject_count_label = None
 ai_post_pending_count_label = None
+post_ai_review_refresh = None
+recommended_jobs_refresh = None
 
 # Rules / Settings UI references
 company_grid = None
@@ -2006,6 +2024,11 @@ def load_fetched_jobs() -> list[dict]:
                 j.post_ai_review_category,
                 j.post_ai_rule_key,
                 j.post_ai_evaluated_at,
+                post_rule.rule_name AS post_ai_rule_name,
+                post_rule.notes AS post_ai_rule_notes,
+                j.final_decision,
+                j.final_decided_at,
+                j.final_notes,
 
                 f.role_family AS ai_role_family,
                 f.role_families_json AS ai_role_families_json,
@@ -2049,6 +2072,10 @@ def load_fetched_jobs() -> list[dict]:
 
             LEFT JOIN job_ai_facts f
                 ON f.job_id = j.job_id
+
+            LEFT JOIN pipeline_rules post_rule
+                ON post_rule.rule_key = j.post_ai_rule_key
+               AND post_rule.stage = 'POST_AI'
 
             WHERE j.details_status = 'FETCHED'
 
@@ -2159,14 +2186,45 @@ def load_fetched_jobs() -> list[dict]:
                     "post_ai_reason":
                         row["post_ai_reason"] or "",
 
+                    "post_ai_reason_display":
+                        row["post_ai_rule_name"]
+                        or (
+                            row["post_ai_review_category"]
+                            or row["post_ai_rule_key"]
+                            or row["post_ai_reason"]
+                            or ""
+                        )
+                        .removeprefix("pipeline_rule:")
+                        .replace("_", " ")
+                        .strip()
+                        .capitalize(),
+
+                    "post_ai_rule_notes":
+                        row["post_ai_rule_notes"] or "",
+
                     "post_ai_review_category":
                         row["post_ai_review_category"] or "",
+
+                    "post_ai_review_category_display":
+                        (row["post_ai_review_category"] or "")
+                        .replace("_", " ")
+                        .strip()
+                        .title(),
 
                     "post_ai_rule_key":
                         row["post_ai_rule_key"] or "",
 
                     "post_ai_evaluated_at":
                         row["post_ai_evaluated_at"] or "",
+
+                    "final_decision":
+                        row["final_decision"] or "",
+
+                    "final_decided_at":
+                        row["final_decided_at"] or "",
+
+                    "final_notes":
+                        row["final_notes"] or "",
 
                     "ai_role_family":
                         row["ai_role_family"] or "",
@@ -2565,6 +2623,177 @@ def load_ai_extracted_jobs() -> list[dict]:
     ]
 
 
+def load_final_review_jobs(
+    view: str = "PENDING",
+    scope_value: str = "Latest run",
+) -> list[dict]:
+    """Load final human-review rows with the batch that owns each decision."""
+    connection = connect_database()
+    try:
+        if scope_value == "Latest run":
+            batch = connection.execute(
+                """
+                SELECT batch_id
+                FROM daily_batches
+                WHERE status = 'COMPLETE'
+                ORDER BY COALESCE(pipeline_completed_at, updated_at) DESC, batch_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if batch is None:
+                return []
+            memberships = {
+                row["job_id"]: int(batch["batch_id"])
+                for row in connection.execute(
+                    "SELECT job_id FROM daily_batch_jobs WHERE batch_id = ?",
+                    (batch["batch_id"],),
+                )
+            }
+        else:
+            memberships = {
+                row["job_id"]: int(row["batch_id"])
+                for row in connection.execute(
+                    """
+                    SELECT b.job_id, MAX(b.batch_id) AS batch_id
+                    FROM daily_batch_jobs b
+                    JOIN daily_batches d ON d.batch_id = b.batch_id
+                    WHERE d.status = 'COMPLETE'
+                    GROUP BY b.job_id
+                    """
+                )
+            }
+    finally:
+        connection.close()
+
+    normalized = view.strip().upper()
+    rows = []
+    for row in load_fetched_jobs():
+        if row["job_id"] not in memberships:
+            continue
+        decision = row["final_decision"]
+        include = (
+            normalized == "PENDING"
+            and row["post_ai_status"] in {"SHORTLIST", "REVIEW", "REJECT"}
+            and not decision
+        ) or (normalized == "ACCEPTED" and decision == "ACCEPTED") or (
+            normalized == "REJECTED" and decision == "REJECTED"
+        )
+        if include:
+            row["final_batch_id"] = memberships[row["job_id"]]
+            row["human_decision_display"] = (
+                "KEEP"
+                if decision == "ACCEPTED"
+                else "EXCLUDE"
+                if decision == "REJECTED"
+                else ""
+            )
+            row["ai_role_families_display"] = ", ".join(row["ai_role_families"])
+            row["ai_languages_display"] = ", ".join(row["ai_languages_required"])
+            rows.append(row)
+    return rows
+
+
+def load_recommended_jobs(
+    scope_value: str = "Latest run",
+) -> list[dict]:
+    """Load only jobs explicitly kept during Post-AI Review."""
+    return load_final_review_jobs("ACCEPTED", scope_value)
+
+
+def final_review_grid_options(rows: list[dict]) -> dict:
+    return {
+        **MOBILE_GRID_EVENT_HANDLERS,
+        "defaultColDef": {"sortable": True, "filter": True, "resizable": True},
+        "columnDefs": [
+            {
+                "headerName": "Post-AI recommendation",
+                "field": "post_ai_status",
+                "width": 190,
+                "pinned": "left",
+                "cellClassRules": {
+                    "suggest-keep": "value === 'SHORTLIST'",
+                    "suggest-exclude": "value === 'REJECT'",
+                    "suggest-review": "value === 'REVIEW' || !value",
+                },
+            },
+            {
+                "headerName": "Why AI proposed this",
+                "field": "post_ai_reason_display",
+                "minWidth": 280,
+                "flex": 1,
+                "pinned": "left",
+                "tooltipField": "post_ai_rule_notes",
+            },
+            {
+                "headerName": "Review category",
+                "field": "post_ai_review_category_display",
+                "minWidth": 165,
+            },
+            {
+                "headerName": "Human decision",
+                "field": "human_decision_display",
+                "width": 145,
+                "cellClassRules": {
+                    "suggest-keep": "value === 'KEEP'",
+                    "suggest-exclude": "value === 'EXCLUDE'",
+                    "suggest-review": "!value",
+                },
+            },
+            {"headerName": "Job title", "field": "title", "minWidth": 260, "flex": 2},
+            {"headerName": "Company", "field": "company", "minWidth": 180, "flex": 1},
+            {"headerName": "Location", "field": "location", "minWidth": 210},
+            {"headerName": "Primary role", "field": "ai_role_family", "minWidth": 160},
+            {"headerName": "Seniority", "field": "ai_seniority", "width": 125},
+            {"headerName": "Min req yrs", "field": "ai_minimum_years_experience", "width": 115},
+            {"headerName": "Required langs", "field": "ai_languages_display", "minWidth": 180},
+            {"headerName": "Role families", "field": "ai_role_families_display", "minWidth": 240},
+            {"headerName": "Decided", "field": "final_decided_at", "minWidth": 210},
+            {"field": "job_id", "hide": True},
+            {"field": "final_batch_id", "hide": True},
+            {"field": "final_decision", "hide": True},
+            {"field": "post_ai_reason", "hide": True},
+            {"field": "post_ai_rule_notes", "hide": True},
+            {"field": "description", "hide": True},
+            {"field": "job_url", "hide": True},
+            {"field": "job_url_direct", "hide": True},
+            {"field": "classifier_status", "hide": True},
+            {"field": "metadata_gate_status", "hide": True},
+            {"field": "metadata_gate_reason", "hide": True},
+            {"field": "job_type", "hide": True},
+            {"field": "job_level", "hide": True},
+            {"field": "ai_role_families", "hide": True},
+            {"field": "ai_data_engineering_hybrid", "hide": True},
+            {"field": "ai_preferred_years_experience", "hide": True},
+            {"field": "ai_degree_required", "hide": True},
+            {"field": "ai_minimum_degree_level", "hide": True},
+            {"field": "ai_phd_required", "hide": True},
+            {"field": "ai_phd_preferred", "hide": True},
+            {"field": "ai_student_status_required", "hide": True},
+            {"field": "ai_languages_required", "hide": True},
+            {"field": "ai_languages_preferred", "hide": True},
+            {"field": "ai_languages_bonus", "hide": True},
+            {"field": "ai_skills_required", "hide": True},
+            {"field": "ai_skills_preferred", "hide": True},
+            {"field": "ai_role_summary", "hide": True},
+            {"field": "ai_core_responsibilities", "hide": True},
+            {"field": "ai_remote_mode", "hide": True},
+            {"field": "ai_management_responsibility", "hide": True},
+            {"field": "ai_security_clearance_required", "hide": True},
+            {"field": "ai_extraction_confidence", "hide": True},
+            {"field": "ai_evidence", "hide": True},
+        ],
+        "rowData": rows,
+        "rowSelection": {
+            "mode": "multiRow",
+            "checkboxes": True,
+            "headerCheckbox": True,
+            "enableClickSelection": True,
+        },
+        "selectionColumnDef": {"width": 54, "pinned": "left"},
+        "suppressCellFocus": True,
+    }
+
+
 def ai_extracted_grid_options(
     rows: list[dict],
 ) -> dict:
@@ -2815,7 +3044,12 @@ def ai_extracted_grid_options(
 
 def show_job_detail_dialog(
     row: dict,
+    final_decision_handler=None,
 ):
+
+    def save_and_close(decision: str) -> None:
+        dialog.close()
+        final_decision_handler(decision)
 
     with ui.dialog() as dialog:
 
@@ -2911,6 +3145,31 @@ def show_job_detail_dialog(
                         "bg-slate-700"
                     )
 
+                if row.get("post_ai_status"):
+                    ui.badge(
+                        "POST-AI " + row["post_ai_status"]
+                    ).classes(
+                        "bg-emerald-800"
+                        if row["post_ai_status"] == "SHORTLIST"
+                        else "bg-red-800"
+                        if row["post_ai_status"] == "REJECT"
+                        else "bg-amber-800"
+                    )
+
+                if row.get("final_decision"):
+                    human_decision = (
+                        "KEEP"
+                        if row["final_decision"] == "ACCEPTED"
+                        else "EXCLUDE"
+                    )
+                    ui.badge(
+                        "HUMAN " + human_decision
+                    ).classes(
+                        "bg-emerald-800"
+                        if row["final_decision"] == "ACCEPTED"
+                        else "bg-red-800"
+                    )
+
             if row[
                 "metadata_gate_reason"
             ]:
@@ -2922,6 +3181,13 @@ def show_job_detail_dialog(
                 ).classes(
                     "text-sm text-gray-400"
                 )
+
+        if row.get("post_ai_reason_display"):
+            ui.label(
+                "Post-AI proposal reason: " + row["post_ai_reason_display"]
+            ).classes("text-sm text-gray-400")
+        if row.get("post_ai_rule_notes"):
+            ui.label(row["post_ai_rule_notes"]).classes("text-sm text-gray-400")
 
             if row[
                 "ai_status"
@@ -3271,6 +3537,17 @@ def show_job_detail_dialog(
 
                 ui.space()
 
+                if final_decision_handler is not None:
+                    ui.button(
+                        "Keep",
+                        on_click=lambda: save_and_close("ACCEPTED"),
+                    ).props("unelevated").classes("btn-keep")
+
+                    ui.button(
+                        "Exclude",
+                        on_click=lambda: save_and_close("REJECTED"),
+                    ).props("unelevated").classes("btn-exclude")
+
                 ui.button(
                     "Close",
                     on_click=dialog.close,
@@ -3470,6 +3747,9 @@ def reapply_post_ai_rules_from_ui():
         )
         return
 
+    with database(DATABASE_PATH) as connection:
+        refresh_all_final_review_states(connection)
+
     ui.notify(
         (
             f"POST_AI: {counts['SHORTLIST']} shortlist, "
@@ -3480,6 +3760,10 @@ def reapply_post_ai_rules_from_ui():
     )
 
     ai_extracted_jobs_area.refresh()
+    if post_ai_review_refresh is not None:
+        post_ai_review_refresh()
+    if recommended_jobs_refresh is not None:
+        recommended_jobs_refresh()
 
 
 @ui.refreshable
@@ -5161,8 +5445,14 @@ def refresh_continue_pipeline_state():
             pipeline_status_label.set_text("Pipeline is currently processing.")
         elif batch["status"] == "COMPLETE":
             continue_pipeline_button.disable()
+            final_pending = int(batch["final_pending_count"] or 0)
+            suffix = (
+                f" {final_pending} AI proposal(s) await Post-AI Review."
+                if final_pending
+                else " Post-AI Review is complete."
+            )
             pipeline_status_label.set_text(
-                f"Pipeline completed for {batch['batch_date']}."
+                f"Pipeline completed for {batch['batch_date']}.{suffix}"
             )
         elif batch["status"] == "FAILED":
             continue_pipeline_button.enable()
@@ -5207,7 +5497,7 @@ async def continue_pipeline_from_ui():
 
         pipeline_status_label.set_text(
             f"Task {task_name} started. The review portal will close shortly. "
-            "It will reopen before the results email is sent."
+            "It will reopen before the Post-AI-review email is sent."
         )
         ui.notify(
             "Pipeline worker started; this portal will close shortly.",
@@ -5254,6 +5544,10 @@ async def continue_pipeline_from_ui():
         )
         fetched_jobs_area.refresh()
         ai_extracted_jobs_area.refresh()
+        if post_ai_review_refresh is not None:
+            post_ai_review_refresh()
+        if recommended_jobs_refresh is not None:
+            recommended_jobs_refresh()
         review_grid_area.refresh()
     finally:
         refresh_continue_pipeline_state()
@@ -5469,6 +5763,257 @@ def action_bar(target_grid_getter=None):
         )
 
 
+def build_post_ai_review_tab() -> None:
+    global post_ai_review_refresh
+    state = {"view": "PENDING", "scope": "Latest run", "size": 25, "index": 0}
+    view_labels = {
+        "PENDING": "Pending AI proposals",
+        "ACCEPTED": "Kept",
+        "REJECTED": "Excluded",
+    }
+
+    def change_view(event) -> None:
+        state["view"] = event.value
+        state["index"] = 0
+        post_ai_review_area.refresh()
+
+    with ui.tabs(value="PENDING", on_change=change_view).props(
+        "mobile-arrows align=left"
+    ).classes("w-full mobile-scroll-tabs"):
+        ui.tab("PENDING", label="Pending AI proposals")
+        ui.tab("ACCEPTED", label="Kept")
+        ui.tab("REJECTED", label="Excluded")
+
+    @ui.refreshable
+    def post_ai_review_area() -> None:
+        all_rows = load_final_review_jobs(state["view"], state["scope"])
+        total_pages = max(1, (len(all_rows) + state["size"] - 1) // state["size"])
+        state["index"] = min(state["index"], total_pages - 1)
+        start = state["index"] * state["size"]
+        visible = all_rows[start:start + state["size"]]
+        client_grid = None
+
+        def save_rows(rows: list[dict], decision: str) -> None:
+            if not rows:
+                ui.notify("Select at least one job first.", type="warning")
+                return
+            by_batch: dict[int, list[str]] = {}
+            for row in rows:
+                by_batch.setdefault(int(row["final_batch_id"]), []).append(row["job_id"])
+            saved = 0
+            with database(DATABASE_PATH) as connection:
+                for batch_id, selected_ids in by_batch.items():
+                    result = set_final_decisions(
+                        connection,
+                        batch_id,
+                        selected_ids,
+                        decision,
+                    )
+                    saved += int(result["saved"])
+            human_label = "KEEP" if decision == "ACCEPTED" else "EXCLUDE"
+            ui.notify(
+                f"{saved} job(s) marked {human_label}.",
+                type="positive" if saved else "warning",
+            )
+            post_ai_review_area.refresh()
+            if recommended_jobs_refresh is not None:
+                recommended_jobs_refresh()
+
+        async def selected_rows() -> list[dict]:
+            if client_grid is None:
+                return []
+            return await client_grid.get_selected_rows()
+
+        async def decide_selected(decision: str) -> None:
+            save_rows(await selected_rows(), decision)
+
+        async def keep_selected() -> None:
+            await decide_selected("ACCEPTED")
+
+        async def exclude_selected() -> None:
+            await decide_selected("REJECTED")
+
+        async def read_selected() -> None:
+            rows = await selected_rows()
+            if len(rows) != 1:
+                ui.notify("Select exactly one job to read.", type="warning")
+                return
+            row = rows[0]
+            show_job_detail_dialog(
+                row,
+                final_decision_handler=lambda decision: save_rows([row], decision),
+            )
+
+        def scope_changed(event) -> None:
+            state["scope"] = event.value
+            state["index"] = 0
+            post_ai_review_area.refresh()
+
+        def size_changed(event) -> None:
+            state["size"] = int(event.value)
+            state["index"] = 0
+            post_ai_review_area.refresh()
+
+        def previous() -> None:
+            state["index"] = max(0, state["index"] - 1)
+            post_ai_review_area.refresh()
+
+        def next_page() -> None:
+            state["index"] = min(total_pages - 1, state["index"] + 1)
+            post_ai_review_area.refresh()
+
+        with ui.row().classes("w-full gap-4 mobile-metric-row"):
+            with ui.card().classes("metric-card"):
+                ui.label(view_labels[state["view"]]).classes(
+                    "text-sm text-gray-400"
+                )
+                ui.label(str(len(all_rows))).classes("text-2xl font-bold")
+            with ui.card().classes("metric-card"):
+                ui.label("Visible jobs").classes("text-sm text-gray-400")
+                ui.label(str(len(visible))).classes("text-2xl font-bold")
+            with ui.card().classes("metric-card"):
+                ui.label("Page").classes("text-sm text-gray-400")
+                ui.label(f"{state['index'] + 1} / {total_pages}").classes("text-2xl font-bold")
+
+        with ui.row().classes("w-full items-end gap-3 mobile-controls"):
+            ui.select(
+                POST_AI_REVIEW_SCOPE_OPTIONS,
+                value=state["scope"],
+                label="Post-AI review scope",
+                on_change=scope_changed,
+            ).classes("w-64")
+            ui.select(
+                BATCH_SIZE_OPTIONS,
+                value=state["size"],
+                label="Jobs per page",
+                on_change=size_changed,
+            ).classes("w-48")
+            ui.button("Refresh", on_click=post_ai_review_area.refresh).props(
+                "unelevated"
+            ).classes("btn-neutral")
+            ui.space()
+            ui.button("← Previous", on_click=previous).props("unelevated").classes("btn-nav")
+            ui.button("Next →", on_click=next_page).props("unelevated").classes("btn-nav")
+
+        with ui.row().classes("w-full items-center gap-3 mobile-action-bar"):
+            ui.button("Read selected job", on_click=read_selected).props(
+                "unelevated"
+            ).classes("btn-nav")
+            ui.button("KEEP SELECTED", on_click=keep_selected).props(
+                "unelevated"
+            ).classes("btn-keep")
+            ui.button("EXCLUDE SELECTED", on_click=exclude_selected).props(
+                "unelevated"
+            ).classes("btn-exclude")
+
+        client_grid = ui.aggrid(final_review_grid_options(visible)).classes("w-full").style(
+            "height: 64vh;"
+        )
+
+        ui.button(
+            "Close review portal",
+            on_click=close_review_portal_from_ui,
+        ).props("unelevated").classes("btn-neutral mt-3")
+
+    post_ai_review_area()
+    post_ai_review_refresh = post_ai_review_area.refresh
+
+
+def build_recommended_jobs_tab() -> None:
+    global recommended_jobs_refresh
+    state = {"scope": "Latest run", "size": 25, "index": 0}
+
+    @ui.refreshable
+    def recommended_jobs_area() -> None:
+        all_rows = load_recommended_jobs(state["scope"])
+        total_pages = max(1, (len(all_rows) + state["size"] - 1) // state["size"])
+        state["index"] = min(state["index"], total_pages - 1)
+        start = state["index"] * state["size"]
+        visible = all_rows[start:start + state["size"]]
+        client_grid = None
+
+        async def read_selected() -> None:
+            if client_grid is None:
+                return
+            rows = await client_grid.get_selected_rows()
+            if len(rows) != 1:
+                ui.notify("Select exactly one job to read.", type="warning")
+                return
+            show_job_detail_dialog(rows[0])
+
+        def scope_changed(event) -> None:
+            state["scope"] = event.value
+            state["index"] = 0
+            recommended_jobs_area.refresh()
+
+        def size_changed(event) -> None:
+            state["size"] = int(event.value)
+            state["index"] = 0
+            recommended_jobs_area.refresh()
+
+        def previous() -> None:
+            state["index"] = max(0, state["index"] - 1)
+            recommended_jobs_area.refresh()
+
+        def next_page() -> None:
+            state["index"] = min(total_pages - 1, state["index"] + 1)
+            recommended_jobs_area.refresh()
+
+        with ui.row().classes("w-full gap-4 mobile-metric-row"):
+            with ui.card().classes("metric-card"):
+                ui.label("Recommended jobs").classes("text-sm text-gray-400")
+                ui.label(str(len(all_rows))).classes("text-2xl font-bold")
+            with ui.card().classes("metric-card"):
+                ui.label("Visible jobs").classes("text-sm text-gray-400")
+                ui.label(str(len(visible))).classes("text-2xl font-bold")
+            with ui.card().classes("metric-card"):
+                ui.label("Page").classes("text-sm text-gray-400")
+                ui.label(f"{state['index'] + 1} / {total_pages}").classes(
+                    "text-2xl font-bold"
+                )
+
+        with ui.row().classes("w-full items-end gap-3 mobile-controls"):
+            ui.select(
+                RECOMMENDED_JOBS_SCOPE_OPTIONS,
+                value=state["scope"],
+                label="Recommended-job scope",
+                on_change=scope_changed,
+            ).classes("w-64")
+            ui.select(
+                BATCH_SIZE_OPTIONS,
+                value=state["size"],
+                label="Jobs per page",
+                on_change=size_changed,
+            ).classes("w-48")
+            ui.button("Refresh", on_click=recommended_jobs_area.refresh).props(
+                "unelevated"
+            ).classes("btn-neutral")
+            ui.space()
+            ui.button("← Previous", on_click=previous).props("unelevated").classes(
+                "btn-nav"
+            )
+            ui.button("Next →", on_click=next_page).props("unelevated").classes(
+                "btn-nav"
+            )
+
+        with ui.row().classes("w-full items-center gap-3 mobile-action-bar"):
+            ui.button("Read selected job", on_click=read_selected).props(
+                "unelevated"
+            ).classes("btn-nav")
+
+        client_grid = ui.aggrid(final_review_grid_options(visible)).classes(
+            "w-full"
+        ).style("height: 64vh;")
+
+        ui.button(
+            "Close review portal",
+            on_click=close_review_portal_from_ui,
+        ).props("unelevated").classes("btn-neutral mt-3")
+
+    recommended_jobs_area()
+    recommended_jobs_refresh = recommended_jobs_area.refresh
+
+
 # =============================================================================
 # PAGE
 # =============================================================================
@@ -5476,7 +6021,12 @@ def action_bar(target_grid_getter=None):
 def _initial_ui_view(request: Request | None) -> str:
     if request is None:
         return "review"
-    return "results" if request.url.path.rstrip("/") == "/results" else "review"
+    path = request.url.path.rstrip("/")
+    if path in {"/post-ai-review", "/results", "/final-review"}:
+        return "post_ai_review"
+    if path == "/recommended-jobs":
+        return "recommended_jobs"
+    return "review"
 
 
 def build_ui(request: Request | None = None) -> None:
@@ -5810,8 +6360,13 @@ def build_ui(request: Request | None = None) -> None:
             )
 
             post_ai_tab = ui.tab(
-                "results",
-                label="Post-AI Extraction",
+                "post_ai_review",
+                label="Post-AI Review",
+            )
+
+            recommended_jobs_tab = ui.tab(
+                "recommended_jobs",
+                label="Recommended Jobs",
             )
 
             rules_tab = ui.tab(
@@ -5821,7 +6376,10 @@ def build_ui(request: Request | None = None) -> None:
 
         with ui.tab_panels(
             tabs,
-            value=post_ai_tab if initial_view == "results" else review_tab,
+            value={
+                "post_ai_review": post_ai_tab,
+                "recommended_jobs": recommended_jobs_tab,
+            }.get(initial_view, review_tab),
         ).classes(
             "w-full bg-transparent"
         ):
@@ -6103,7 +6661,7 @@ def build_ui(request: Request | None = None) -> None:
                 fetched_jobs_area()
 
             # =====================================================================
-            # POST-AI EXTRACTION
+            # POST-AI REVIEW
             # =====================================================================
 
             with ui.tab_panel(
@@ -6113,17 +6671,17 @@ def build_ui(request: Request | None = None) -> None:
             ):
 
                 ui.label(
-                    "Post-AI Extraction"
+                    "Post-AI Review"
                 ).classes(
                     "text-2xl font-bold mt-2"
                 )
 
                 ui.label(
                     (
-                        "Only jobs with ai_status=EXTRACTED appear here. "
-                        "This view is dedicated to the structured facts produced "
-                        "by Gemma/Pydantic and is separate from the description-"
-                        "fetching workflow."
+                        "Post-AI proposes SHORTLIST, REVIEW, or REJECT for every "
+                        "extracted job. Review every proposal here and make the "
+                        "authoritative human KEEP or EXCLUDE decision. Only jobs "
+                        "you keep appear in Recommended Jobs."
                     )
                 ).classes(
                     "text-gray-300"
@@ -6155,7 +6713,7 @@ def build_ui(request: Request | None = None) -> None:
                     ):
 
                         ui.label(
-                            "SHORTLIST"
+                            "SHORTLIST recommendations"
                         ).classes(
                             "text-sm text-gray-400"
                         )
@@ -6172,7 +6730,7 @@ def build_ui(request: Request | None = None) -> None:
                     ):
 
                         ui.label(
-                            "REVIEW"
+                            "Automated REVIEW"
                         ).classes(
                             "text-sm text-gray-400"
                         )
@@ -6189,7 +6747,7 @@ def build_ui(request: Request | None = None) -> None:
                     ):
 
                         ui.label(
-                            "REJECT"
+                            "Automated REJECT"
                         ).classes(
                             "text-sm text-gray-400"
                         )
@@ -6206,7 +6764,7 @@ def build_ui(request: Request | None = None) -> None:
                     ):
 
                         ui.label(
-                            "POST_AI pending"
+                            "Rules pending"
                         ).classes(
                             "text-sm text-gray-400"
                         )
@@ -6218,7 +6776,30 @@ def build_ui(request: Request | None = None) -> None:
                             )
                         )
 
-                ai_extracted_jobs_area()
+                build_post_ai_review_tab()
+
+                with ui.expansion(
+                    "All automated Post-AI results",
+                    icon="analytics",
+                ).classes("w-full mt-3"):
+                    ui.label(
+                        "Read-only audit of every structured AI extraction and its "
+                        "automated Post-AI outcome."
+                    ).classes("text-sm text-gray-400")
+                    ai_extracted_jobs_area()
+
+            # =====================================================================
+            # RECOMMENDED JOBS
+            # =====================================================================
+
+            with ui.tab_panel(recommended_jobs_tab).classes("p-0"):
+                ui.label("Recommended Jobs").classes("text-2xl font-bold mt-2")
+                ui.label(
+                    "These are the jobs you kept during Post-AI Review. Read the "
+                    "full description and use the stored application links here. "
+                    "To change a decision, return to the Kept view in Post-AI Review."
+                ).classes("text-gray-300")
+                build_recommended_jobs_tab()
 
             # =====================================================================
             # RULES / SETTINGS

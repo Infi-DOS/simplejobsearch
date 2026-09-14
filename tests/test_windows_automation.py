@@ -45,8 +45,8 @@ def test_review_portal_health_requires_local_web_and_matching_tunnel(monkeypatch
 
     assert windows_automation.review_portal_is_ready() is True
     assert calls == [
-        ("http://127.0.0.1:5099/review", 2.0),
-        ("http://127.0.0.1:4040/api/tunnels", 2.0),
+        ("http://127.0.0.1:5099/review", 10.0),
+        ("http://127.0.0.1:4040/api/tunnels", 10.0),
     ]
 
 

@@ -84,6 +84,9 @@ EFFECTIVE_TPM = int(
 # Official Google guidance says ~4 chars/token for Gemini-family tokenization.
 # We intentionally estimate slightly conservatively before launch.
 CHARS_PER_TOKEN_ESTIMATE = SETTINGS.ai.chars_per_token_estimate
+# Historical configuration name retained for compatibility. This is a fresh
+# provider-request budget for each explicit extraction invocation; the stored
+# ai_attempt_count remains cumulative telemetry across invocations.
 MAX_ATTEMPTS_PER_JOB = SETTINGS.ai.max_attempts_per_job
 MAX_SCHEMA_REPAIR_ATTEMPTS = SETTINGS.ai.max_schema_repair_attempts
 AI_RETRY_BASE_SECONDS = SETTINGS.ai.retry_base_seconds
@@ -944,16 +947,10 @@ def load_queue(
 
         FROM ready_for_ai
 
-        WHERE
-            COALESCE(
-                ai_attempt_count,
-                0
-            ) < ?
+        WHERE 1 = 1
     """
 
-    params: list[object] = [
-        MAX_ATTEMPTS_PER_JOB
-    ]
+    params: list[object] = []
 
     if job_ids is not None:
         selected = list(dict.fromkeys(job_ids))
@@ -1812,11 +1809,10 @@ async def process_job(
         f"{job['company']}"
     )
 
-    attempts_remaining = max(
-        0,
-        MAX_ATTEMPTS_PER_JOB
-        - int(job["ai_attempt_count"] or 0),
-    )
+    # The persisted counter is lifetime telemetry. A user-triggered pipeline
+    # continuation receives a new, bounded retry budget so a temporary provider
+    # outage cannot make a job permanently ineligible.
+    attempts_remaining = MAX_ATTEMPTS_PER_JOB
     attempts_this_run = 0
     retry_number = 0
 
@@ -2096,6 +2092,11 @@ async def async_main(
     print(
         f"Max concurrency:   "
         f"{MAX_CONCURRENCY}"
+    )
+
+    print(
+        f"Attempts/job/run:  "
+        f"{MAX_ATTEMPTS_PER_JOB}"
     )
 
     print(

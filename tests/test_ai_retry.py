@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import sys
 from types import SimpleNamespace
 
@@ -56,6 +57,67 @@ def test_invalid_retry_configuration_fails_clearly(monkeypatch):
     with pytest.raises(ValueError, match="AI_RETRY_MAX_SECONDS"):
         config.get_settings()
     config.reset_settings_cache()
+
+
+def test_zero_provider_attempt_budget_fails_clearly(monkeypatch):
+    monkeypatch.setenv("AI_MAX_ATTEMPTS_PER_JOB", "0")
+    config.reset_settings_cache()
+    try:
+        with pytest.raises(ValueError, match="AI_MAX_ATTEMPTS_PER_JOB"):
+            config.get_settings()
+    finally:
+        config.reset_settings_cache()
+
+
+def test_load_queue_includes_failed_job_after_historical_budget(monkeypatch):
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """
+        CREATE TABLE ready_for_ai (
+            job_id TEXT PRIMARY KEY,
+            title TEXT,
+            company TEXT,
+            location TEXT,
+            job_type TEXT,
+            job_level TEXT,
+            job_function TEXT,
+            company_industry TEXT,
+            description TEXT,
+            human_decision TEXT,
+            classifier_status TEXT,
+            review_category TEXT,
+            metadata_gate_status TEXT,
+            ai_status TEXT,
+            ai_attempt_count INTEGER,
+            first_seen_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO ready_for_ai VALUES (
+            'li-exhausted', 'ML Engineer', 'Example', 'Amsterdam',
+            NULL, NULL, NULL, NULL, 'Build ML systems.',
+            'KEEP', 'AUTO_KEEP', 'machine_learning', 'PASS',
+            'FAILED', 7, '2026-09-09T20:00:00+02:00'
+        )
+        """
+    )
+    monkeypatch.setattr(legacy_runtime, "MAX_ATTEMPTS_PER_JOB", 3)
+    monkeypatch.setattr(legacy_runtime, "MAX_JOBS_PER_RUN", 0)
+    monkeypatch.setattr(legacy_runtime, "AI_PROBE_MODE", False)
+
+    try:
+        queue = legacy.load_queue(
+            connection,
+            job_ids=["li-exhausted", "li-exhausted"],
+        )
+    finally:
+        connection.close()
+
+    assert [row["job_id"] for row in queue] == ["li-exhausted"]
+    assert queue[0]["ai_attempt_count"] == 7
 
 
 def test_transient_failure_retries_and_counts_real_provider_attempts(monkeypatch):
@@ -126,7 +188,7 @@ def test_transient_failure_retries_and_counts_real_provider_attempts(monkeypatch
                 "job_id": "li-retry",
                 "title": "ML Engineer",
                 "company": "Example",
-                "ai_attempt_count": 0,
+                "ai_attempt_count": 99,
             },
             1,
             1,
@@ -143,6 +205,92 @@ def test_transient_failure_retries_and_counts_real_provider_attempts(monkeypatch
     assert sum(isinstance(event, tuple) and event[0] == "failure" for event in events) == 1
     assert ("success", "li-retry") in events
     assert "slept" in events
+
+
+def test_historical_attempts_get_fresh_bounded_budget_and_stay_cumulative(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "retry.sqlite3"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY,
+            ai_status TEXT,
+            ai_attempt_count INTEGER,
+            ai_last_attempt_at TEXT,
+            ai_last_error TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO jobs (job_id, ai_status, ai_attempt_count)
+        VALUES ('li-exhausted', 'FAILED', 7)
+        """
+    )
+    connection.commit()
+    connection.close()
+    calls = 0
+
+    def connect_test_database():
+        return sqlite3.connect(database_path)
+
+    async def transient_failure(
+        _aclient,
+        _handler,
+        _job,
+        on_request_acquired=None,
+    ):
+        nonlocal calls
+        calls += 1
+        await on_request_acquired(123)
+        raise ProviderError(503)
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(legacy_runtime, "MAX_ATTEMPTS_PER_JOB", 3)
+    monkeypatch.setattr(legacy_runtime, "connect_database", connect_test_database)
+    monkeypatch.setattr(legacy_runtime, "extract_facts", transient_failure)
+    monkeypatch.setattr(
+        legacy_runtime,
+        "retry_delay_seconds",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(legacy_runtime.asyncio, "sleep", no_sleep)
+
+    result = asyncio.run(
+        legacy.process_job(
+            object(),
+            object(),
+            asyncio.Lock(),
+            {
+                "job_id": "li-exhausted",
+                "title": "ML Engineer",
+                "company": "Example",
+                "ai_attempt_count": 7,
+            },
+            1,
+            1,
+            run_post_ai_after_extraction=False,
+        )
+    )
+
+    connection = sqlite3.connect(database_path)
+    stored = connection.execute(
+        """
+        SELECT ai_status, ai_attempt_count, ai_last_error
+        FROM jobs
+        WHERE job_id='li-exhausted'
+        """
+    ).fetchone()
+    connection.close()
+
+    assert result == ("FAILED", "li-exhausted")
+    assert calls == 3
+    assert stored == ("FAILED", 10, "ProviderError: provider returned 503")
 
 
 def test_deterministic_failure_is_not_retried(monkeypatch):

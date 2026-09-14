@@ -8,19 +8,23 @@ from html import escape
 from typing import Any
 
 from ..config import EmailSettings, get_settings
-from .links import results_url, review_url
+from ..operations import notification_finished, notification_started
+from .links import post_ai_review_url, review_url
 
 LOGGER = logging.getLogger(__name__)
 
 
 def notification_not_attempted(notification_type: str, reason: str) -> dict[str, Any]:
-    return {
+    result = {
         "type": notification_type,
         "status": "NOT_ATTEMPTED",
         "sent": False,
         "reason": reason,
         "error": None,
     }
+    event_id = notification_started(notification_type, {})
+    notification_finished(event_id, result)
+    return result
 
 
 def deliver_notification(
@@ -30,25 +34,29 @@ def deliver_notification(
     notification_type: str,
 ) -> dict[str, Any]:
     """Send a notification without changing the outcome of completed workflow work."""
+    event_id = notification_started(notification_type, summary)
     try:
         sent = bool(sender(summary))
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         LOGGER.exception("%s notification failed", notification_type)
-        return {
+        result = {
             "type": notification_type,
             "status": "FAILED",
             "sent": False,
             "reason": None,
             "error": error,
         }
-    return {
-        "type": notification_type,
-        "status": "SENT" if sent else "SKIPPED",
-        "sent": sent,
-        "reason": None if sent else "sender_returned_false",
-        "error": None,
-    }
+    else:
+        result = {
+            "type": notification_type,
+            "status": "SENT" if sent else "SKIPPED",
+            "sent": sent,
+            "reason": None if sent else "sender_returned_false",
+            "error": None,
+        }
+    notification_finished(event_id, result)
+    return result
 
 
 def _format_summary(summary: Mapping[str, Any]) -> str:
@@ -111,11 +119,11 @@ def _format_pipeline_summary(
 ) -> str:
     totals = summary.get("batch_totals", summary)
     lines = [
-        "Daily job pipeline complete",
+        "Daily job pipeline complete — Post-AI review ready",
         "",
-        f"Shortlist: {_count(totals, 'shortlist', 'shortlist_count')}",
-        f"Review: {_count(totals, 'review', 'final_review_count')}",
-        f"Rejected: {_count(totals, 'reject', 'reject_count')}",
+        f"Waiting for Post-AI review: {_count(totals, 'final_pending', 'shortlist', 'shortlist_count')}",
+        f"Automated REVIEW: {_count(totals, 'review', 'final_review_count')}",
+        f"Automated REJECT: {_count(totals, 'reject', 'reject_count')}",
         "",
         "Batch totals:",
     ]
@@ -129,7 +137,7 @@ def _format_pipeline_summary(
         for key, value in summary.get("this_run", {}).items()
     )
     if action_url:
-        lines.extend(["", "View Results:", action_url])
+        lines.extend(["", "Review Post-AI recommendations:", action_url])
     return "\n".join(lines)
 
 
@@ -193,13 +201,22 @@ def _format_review_html(summary: Mapping[str, Any], action_url: str | None) -> s
 def _format_pipeline_html(summary: Mapping[str, Any], action_url: str | None) -> str:
     totals = summary.get("batch_totals", summary)
     return _format_action_html(
-        "Daily job pipeline complete",
+        "Daily job pipeline complete — Post-AI review ready",
         [
-            ("Shortlist", _count(totals, "shortlist", "shortlist_count")),
-            ("Review", _count(totals, "review", "final_review_count")),
-            ("Rejected", _count(totals, "reject", "reject_count")),
+            (
+                "Waiting for Post-AI review",
+                _count(totals, "final_pending", "shortlist", "shortlist_count"),
+            ),
+            (
+                "Automated REVIEW",
+                _count(totals, "review", "final_review_count"),
+            ),
+            (
+                "Automated REJECT",
+                _count(totals, "reject", "reject_count"),
+            ),
         ],
-        action_label="View Results",
+        action_label="Review Post-AI recommendations",
         action_url=action_url,
     )
 
@@ -277,9 +294,11 @@ def send_review_reminder_email(summary: Mapping[str, Any]) -> bool:
 
 def send_pipeline_complete_email(summary: Mapping[str, Any]) -> bool:
     settings = get_settings()
-    action_url = results_url(settings.web.public_base_url)
+    action_url = post_ai_review_url(settings.web.public_base_url)
     if action_url is None:
-        LOGGER.warning("PUBLIC_BASE_URL is not configured; pipeline email has no link")
+        LOGGER.warning(
+            "PUBLIC_BASE_URL is not configured; Post-AI review email has no link"
+        )
     return _send(
         "Job pipeline complete",
         summary,

@@ -6,7 +6,24 @@ service functions.
 
 ## Pipeline
 
-`DISCOVERY -> PRE_DESCRIPTION -> human review -> DETAILS -> METADATA_GATE -> Gemma extraction -> POST_AI`
+`DISCOVERY -> PRE_DESCRIPTION -> title review -> DETAILS -> METADATA_GATE -> Gemma extraction -> POST_AI recommendation -> Post-AI human review -> Recommended Jobs`
+
+The first human gate remains before description fetching: review the title and
+choose KEEP or EXCLUDE. During continuation, LinkedIn details are fetched
+sequentially, but every successful fetch immediately flows through metadata and
+into a shared asynchronous Gemma worker pool. The workers reuse one rolling
+RPM/TPM limiter and run Post-AI rules immediately after each extraction, so AI
+work overlaps later detail requests without increasing the provider limits.
+
+Post-AI proposes `SHORTLIST`, `REVIEW`, or `REJECT`; none of these automated
+outcomes is the final human decision. Every extracted and classified job enters
+**Post-AI Review**, where the full description and AI facts can be read before
+choosing KEEP or EXCLUDE. Kept jobs appear in **Recommended Jobs**. The
+automated proposal and final human decision are stored separately for auditing.
+Internally, KEEP remains `ACCEPTED` and EXCLUDE remains `REJECTED` for database
+compatibility. The batch remains automation-`COMPLETE`;
+`final_review_status` independently moves from `AWAITING_REVIEW` to
+`FINALIZED` after every Post-AI proposal is decided.
 
 A LinkedIn `job_id` is PRE_DESCRIPTION-classified only when first discovered.
 Rediscovery updates `last_seen_at` and records a search-hit observation without
@@ -25,11 +42,28 @@ detail fetching and metadata evaluation, and every metadata pass has a terminal
 `SHORTLIST`, `REVIEW`, or `REJECT` POST_AI result. Set
 `DETAILS_MAX_JOBS_PER_RUN=0` to process all eligible jobs in one continuation;
 use a positive value only when a per-run cap is wanted. Transient provider
-failures are retried up to
-`AI_MAX_ATTEMPTS_PER_JOB` with bounded exponential backoff and jitter. Configure
-the delay bounds with `AI_RETRY_BASE_SECONDS` and `AI_RETRY_MAX_SECONDS`. If any
-eligible job remains unfinished, the batch stays `FAILED`; running `continue`
-again resumes unfinished work without reprocessing terminal jobs.
+failures receive up to `AI_MAX_ATTEMPTS_PER_JOB` provider requests in each
+explicit continuation, with bounded exponential backoff and jitter. The stored
+`ai_attempt_count` remains cumulative lifetime telemetry; it does not
+permanently disqualify a failed job from a later continuation. A later explicit
+continuation re-admits unfinished `FAILED` rows regardless of the previous error
+classification. Within one invocation, only transient failures are retried by
+the retry loop; configured schema-repair requests count against the same
+provider-request budget. Configure the delay bounds with
+`AI_RETRY_BASE_SECONDS` and `AI_RETRY_MAX_SECONDS`. If any eligible job remains
+unfinished, the batch stays `FAILED`; running `continue` again gives unfinished
+AI jobs a fresh bounded retry budget without reprocessing terminal extracted
+jobs.
+
+The conservative provider defaults can be overridden in `.env`:
+
+```dotenv
+AI_TARGET_RPM=10
+AI_MAX_CONCURRENCY=4
+AI_MAX_ATTEMPTS_PER_JOB=3
+AI_RETRY_BASE_SECONDS=15
+AI_RETRY_MAX_SECONDS=120
+```
 
 ## Local setup
 
@@ -75,6 +109,7 @@ simplejobsearch email-test complete
 ```
 
 Equivalent module commands use `python -m simplejobsearch.cli <command>`.
+The historical `jobsimplesearch` command remains an alias for the same CLI.
 
 ## Public/mobile access
 
@@ -89,13 +124,16 @@ PUBLIC_BASE_URL=https://your-domain.ngrok-free.app
 
 Trailing slashes are removed during configuration loading. Never derive public
 links from `WEB_HOST`; `0.0.0.0` is a bind address, not a user-facing URL. The
-shared NiceGUI root supports `/review` for Review Inbox and `/results` for
-Post-AI Extraction without duplicating the UI.
+shared NiceGUI root supports `/review` for Review Inbox,
+`/post-ai-review` for the human review of Post-AI recommendations, and
+`/recommended-jobs` for the jobs the human kept. Legacy `/results` and
+`/final-review` links still open Post-AI Review so old messages and bookmarks do
+not break.
 
 Search and review messages link to `/review`; pipeline-completion messages link
-to `/results`. Each message contains both a plain-text URL and an HTML action
-button. If `PUBLIC_BASE_URL` is empty, messages are still sent without a link
-and a warning is logged.
+to `/post-ai-review`. Each message contains both a plain-text URL and an HTML
+action button. If `PUBLIC_BASE_URL` is empty, messages are still sent without a
+link and a warning is logged.
 
 For manual ngrok testing, start `simplejobsearch web`, then expose port 5000
 with an OAuth-protected ngrok endpoint. Keep the ngrok authtoken in ngrok's own
@@ -105,16 +143,20 @@ the HTTPS endpoint and authentication flow work from a phone over mobile data.
 ## Windows Task Scheduler lifecycle
 
 Windows automation is opt-in. It uses Windows Task Scheduler instead of the
-long-running `simplejobsearch scheduler` command and registers four tasks:
+long-running `simplejobsearch scheduler` command and registers five tasks:
 
 - `JobSimpleSearch-Nightly` at 22:30 searches first, starts NiceGUI/ngrok, and
   then sends the search email.
 - `JobSimpleSearch-ReviewReminder` at 08:00 ensures the portal is running before
   sending the reminder.
 - `JobSimpleSearch-Continue` is an on-demand independent worker started by the
-  Continue Pipeline button.
+  Continue Pipeline button. It streams each fetched job into metadata, AI, and
+  Post-AI while later descriptions are still being fetched.
 - `JobSimpleSearch-ClosePortal` is an on-demand independent shutdown worker
   used by the Continue Pipeline and Close review portal buttons.
+- `JobSimpleSearch-Recovery` runs one minute after sign-in. It catches up missing
+  discovery using the same nightly function, restores the review portal, and
+  sends a missed review reminder when appropriate. It never starts continuation.
 
 The nightly and reminder workers check both the local NiceGUI endpoint and the
 configured ngrok tunnel before sending an email. A healthy existing portal is
@@ -143,19 +185,56 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows\Register-Tasks.ps1
 
 The registered tasks use the current interactive Windows account, so that user
 must remain logged on. The tasks are configured with `WakeToRun` and
-`StartWhenAvailable`, but Windows power policy must still permit wake timers.
+`StartWhenAvailable`, and can start and continue on battery power. Windows power
+policy must still permit wake timers. After a reboot, sign in to allow recovery;
+these tasks cannot run while the account is logged off. No Windows Update,
+automatic-login, or system-wide power settings are changed by registration.
 
 With automation enabled, Continue Pipeline starts the independent scheduled
 worker and then closes the managed NiceGUI/ngrok processes. The worker performs
 details, metadata, AI, and Post-AI processing. On success it restarts the portal
-before sending the results email. If the pipeline fails, it also attempts to
-restore the portal so retry controls remain reachable. The Post-AI page ends
+before sending the Post-AI-review email. If the pipeline fails, it also attempts
+to restore the portal so retry controls remain reachable. The Post-AI Review
+and Recommended Jobs pages end
 with a **Close review portal** button that shuts down only the PID-validated
 NiceGUI and ngrok processes started by these scripts.
 
 Runtime PID files and process logs are written under `data/windows-runtime/`.
+Every Windows worker writes a timestamped transcript under
+`data/windows-runtime/logs/`, including its final exit code. Worker processes
+are hidden. Exit 1 reports workflow failure; exit 2 reports a separate email
+failure. A successful batch remains successful if its email fails.
 The scripts refuse to kill an unrelated process and refuse to take over an
 already-running unmanaged server or tunnel.
+
+Task starts and results are also persisted in `task_runs`. Email attempts are
+persisted in `notification_events`, including their batch, timestamps and
+`SENT`, `SKIPPED`, `FAILED`, or `NOT_ATTEMPTED` result. `SENT` means the SMTP
+server accepted the message; it is not proof of inbox delivery. If a worker
+stops during a send, the attempt remains `SENDING`; the next invocation of that
+task marks it `UNKNOWN` and the abandoned task `INTERRUPTED`. It does not assume
+delivery or automatically resend an unconfirmed message. Recording errors are
+logged without changing the workflow result.
+
+For operational checks and explicit recovery of an older reviewed batch:
+
+```powershell
+simplejobsearch history --limit 20
+simplejobsearch reconcile
+simplejobsearch continue --batch-date 2026-09-11
+# Same continuation with managed portal restoration and a worker transcript:
+powershell -ExecutionPolicy Bypass -File .\scripts\windows\Run-Pipeline.ps1 -BatchDate 2026-09-11
+```
+
+`reconcile` refreshes cached batch counts and states from actual jobs. It does
+not fetch, call AI, send email, or change human decisions. It refuses to run
+while a continuation owns the database's pipeline lock. The default Continue
+button still selects the latest run. The explicit date selects an older batch.
+The same OS lock prevents duplicate workers from CLI, UI and scheduled tasks.
+A failed continuation does not make the nightly task repeat a successful search.
+An interrupted `SEARCHING` batch is retried only when no discovery worker owns
+the separate discovery lock. Completed search results and active searches are
+preserved during sign-in recovery.
 
 For a manual lifecycle check:
 
@@ -228,7 +307,8 @@ performance remains independently measurable. Each query's database-backed
 `SEARCH_LOCATION` are fallbacks for rows without explicit values.
 
 Each search run records hits, unique and new jobs, PRE_DESCRIPTION outcomes,
-metadata outcomes, and final outcomes in `search_query_metrics`, allowing query
+metadata outcomes, automated Post-AI outcomes, and final human accepted/rejected
+outcomes in `search_query_metrics`, allowing query
 and market changes to be measured rather than guessed. Adding Switzerland
 doubles the configured searches from five to ten and therefore also increases
 the discovery runtime and request volume.

@@ -14,6 +14,7 @@ def fetch_approved_details(
     client_factory: Callable = legacy.build_linkedin_client,
     fetcher: Callable = legacy.fetch_job_details,
     wait: Callable[[], None] | None = None,
+    on_fetched: Callable[[str], None] | None = None,
 ) -> dict:
     """Fetch approved jobs without re-running PRE_DESCRIPTION classification."""
     selected = tuple(dict.fromkeys(job_ids)) if job_ids is not None else None
@@ -59,6 +60,8 @@ def fetch_approved_details(
                 summary["fetched"] += 1
                 summary["fetched_job_ids"].append(job["job_id"])
                 consecutive_empty = 0
+                if on_fetched is not None:
+                    on_fetched(job["job_id"])
             summary["processed"] += 1
             if consecutive_empty >= settings.details_stop_after_empty:
                 summary["stopped_early"] = True

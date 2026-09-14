@@ -1,9 +1,10 @@
 [CmdletBinding()]
-param()
+param(
+    [ValidatePattern('^\d{4}-\d{2}-\d{2}$')]
+    [string]$BatchDate
+)
 
-$ErrorActionPreference = 'Stop'
-$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$python = Join-Path $projectRoot '.venv\Scripts\python.exe'
-Set-Location -LiteralPath $projectRoot
-& $python -m simplejobsearch.cli windows-pipeline-worker
+$pipelineArgs = @{Command='windows-pipeline-worker'}
+if ($BatchDate) { $pipelineArgs.BatchDate = $BatchDate }
+& (Join-Path $PSScriptRoot 'Invoke-Worker.ps1') @pipelineArgs
 exit $LASTEXITCODE

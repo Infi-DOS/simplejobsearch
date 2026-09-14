@@ -4,6 +4,7 @@ param(
     [string]$ReminderTaskName = 'JobSimpleSearch-ReviewReminder',
     [string]$PipelineTaskName = 'JobSimpleSearch-Continue',
     [string]$PortalStopTaskName = 'JobSimpleSearch-ClosePortal',
+    [string]$RecoveryTaskName = 'JobSimpleSearch-Recovery',
     [ValidateRange(0, 60)]
     [int]$PortalShutdownDelaySeconds = 3,
     [string]$NightlyAt = '22:30'
@@ -19,6 +20,8 @@ $principal = New-ScheduledTaskPrincipal `
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -WakeToRun `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Hours 8)
 
@@ -28,7 +31,7 @@ function New-ScriptAction {
         [string]$AdditionalArguments = ''
     )
     $scriptPath = Join-Path $PSScriptRoot $ScriptName
-    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+    $arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
     if ($AdditionalArguments) {
         $arguments += " $AdditionalArguments"
     }
@@ -70,8 +73,19 @@ $portalStopTask = New-ScheduledTask `
     -Description 'On-demand PID-validated shutdown of managed NiceGUI and ngrok.'
 Register-ScheduledTask -TaskName $PortalStopTaskName -InputObject $portalStopTask -Force | Out-Null
 
+$recoveryTrigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+$recoveryTrigger.Delay = 'PT1M'
+$recoveryTask = New-ScheduledTask `
+    -Action (New-ScriptAction -ScriptName 'Run-Recovery.ps1') `
+    -Trigger $recoveryTrigger `
+    -Principal $principal `
+    -Settings $settings `
+    -Description 'After sign-in, catch up discovery and restore review access; never continue AI automatically.'
+Register-ScheduledTask -TaskName $RecoveryTaskName -InputObject $recoveryTask -Force | Out-Null
+
 Write-Output "Registered $NightlyTaskName at $NightlyAt"
 Write-Output "Registered $ReminderTaskName at 08:00"
 Write-Output "Registered on-demand task $PipelineTaskName"
 Write-Output "Registered on-demand task $PortalStopTaskName"
+Write-Output "Registered sign-in recovery task $RecoveryTaskName"
 Write-Output 'Tasks use the current interactive Windows account and require it to be logged on.'

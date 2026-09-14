@@ -88,6 +88,7 @@ def test_orchestrator_calls_stages_in_order(tmp_path, monkeypatch):
 
     assert order == ["details", "metadata", "ai", "post_ai", "email"]
     assert result["batch_id"] == batch_id
+    assert result["final_review_status"] == "AWAITING_REVIEW"
     assert result["already_complete"] is False
     assert result["no_op"] is False
     assert result["this_run"]["ai_processed"] == 0
@@ -178,9 +179,13 @@ def test_all_three_smtp_messages_can_be_sent_in_isolation(monkeypatch):
     expected_urls = [
         f"{public_base_url}/review",
         f"{public_base_url}/review",
-        f"{public_base_url}/results",
+        f"{public_base_url}/post-ai-review",
     ]
-    expected_actions = ["View today's jobs", "Review Jobs", "View Results"]
+    expected_actions = [
+        "View today's jobs",
+        "Review Jobs",
+        "Review Post-AI recommendations",
+    ]
     for message, expected_url, expected_action in zip(
         messages,
         expected_urls,
@@ -387,6 +392,7 @@ def test_zero_ai_queue_reports_run_zero_and_existing_batch_total(
     assert result["this_run"]["ai_extracted"] == 0
     assert result["batch_totals"]["ai_extracted"] == 8
     assert result["batch_totals"]["shortlist"] == 2
+    assert result["final_review_status"] == "AWAITING_REVIEW"
     assert result["batch_totals"]["review"] == 1
     assert result["batch_totals"]["reject"] == 5
     assert result["batch_totals"]["post_ai_classified"] == 8

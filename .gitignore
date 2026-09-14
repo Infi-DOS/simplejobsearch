@@ -62,3 +62,4 @@ Desktop.ini
 
 # Archived files
 archive
+*.db.*.lock

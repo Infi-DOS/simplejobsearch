@@ -5,16 +5,19 @@ import logging
 import os
 import subprocess
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
 
 from .config import get_settings
+from .db import apply_migrations, database
 from .notifications.email import (
     send_pipeline_complete_email,
     send_review_reminder_email,
     send_search_complete_email,
 )
+from .operations import recorded_task
 from .pipeline.orchestrator import continue_after_review
 from .scheduler.tasks import morning_review_reminder_task, nightly_search_task
 
@@ -60,7 +63,7 @@ def start_review_portal() -> dict[str, Any]:
             stdout=log_file,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=90,
+            timeout=150,
         )
     return {
         "status": "STARTED",
@@ -68,7 +71,7 @@ def start_review_portal() -> dict[str, Any]:
     }
 
 
-def review_portal_is_ready(*, timeout: float = 2.0) -> bool:
+def review_portal_is_ready(*, timeout: float = 10.0) -> bool:
     """Return whether both NiceGUI and the configured ngrok tunnel are healthy."""
     settings = get_settings()
     public_base_url = settings.web.public_base_url
@@ -163,8 +166,8 @@ def run_windows_review_worker() -> dict:
     )
 
 
-def run_windows_pipeline_worker() -> dict:
-    """Run independently, reopen the portal, then send the results email."""
+def run_windows_pipeline_worker(*, batch_date=None) -> dict:
+    """Run independently, reopen the portal, then send the Post-AI-review email."""
     portal_started = False
 
     def send_results(summary: Mapping[str, Any]) -> bool:
@@ -174,7 +177,8 @@ def run_windows_pipeline_worker() -> dict:
         return send_pipeline_complete_email(summary)
 
     try:
-        result = continue_after_review(email_sender=send_results)
+        selected = {"batch_date": batch_date} if batch_date else {}
+        result = continue_after_review(email_sender=send_results, **selected)
     except Exception:
         try:
             start_review_portal()
@@ -193,4 +197,36 @@ def run_windows_pipeline_worker() -> dict:
             }
     else:
         result["portal"] = {"status": "STARTED"}
+    return result
+
+
+@recorded_task("login_recovery")
+def run_windows_recovery_worker() -> dict:
+    """Recover discovery/review access after login; continuation stays manual."""
+    apply_migrations()
+    # Uses the same date resolution and duplicate-search guard as the nightly task.
+    search = run_windows_nightly_worker()
+    result = {
+        "status": "COMPLETE", "search": search,
+        "notification": search.get("notification", {}),
+    }
+    if not search.get("no_op") and search.get("task_status") == "COMPLETED":
+        return result  # A fresh search already sent its summary.
+    result["portal"] = ensure_review_portal()
+    settings = get_settings()
+    now = datetime.now(settings.timezone)
+    if (now.hour, now.minute) < (
+        settings.scheduler.reminder_hour, settings.scheduler.reminder_minute,
+    ):
+        return result
+    with database() as connection:
+        sent_today = connection.execute(
+            "SELECT 1 FROM notification_events WHERE notification_type='review_reminder' "
+            "AND status='SENT' AND substr(completed_at,1,10)=? LIMIT 1",
+            (now.date().isoformat(),),
+        ).fetchone()
+    if sent_today is None:
+        reminder = run_windows_review_worker()
+        result["reminder"] = reminder
+        result["notification"] = reminder.get("notification", {})
     return result

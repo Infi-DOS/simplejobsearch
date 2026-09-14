@@ -172,8 +172,19 @@ def get_settings() -> Settings:
     thinking_level = os.environ.get("GEMMA_THINKING_LEVEL", "HIGH").strip().upper()
     if thinking_level not in {"HIGH", "MINIMAL"}:
         raise ValueError("GEMMA_THINKING_LEVEL must be HIGH or MINIMAL")
-    ai_retry_base_seconds = _float("AI_RETRY_BASE_SECONDS", 2.0)
-    ai_retry_max_seconds = _float("AI_RETRY_MAX_SECONDS", 30.0)
+    ai_target_rpm = _int("AI_TARGET_RPM", 10)
+    ai_max_concurrency = _int("AI_MAX_CONCURRENCY", 4)
+    ai_max_attempts_per_job = _int("AI_MAX_ATTEMPTS_PER_JOB", 3)
+    ai_retry_base_seconds = _float("AI_RETRY_BASE_SECONDS", 15.0)
+    ai_retry_max_seconds = _float("AI_RETRY_MAX_SECONDS", 120.0)
+    if ai_target_rpm < 1:
+        raise ValueError("AI_TARGET_RPM must be greater than or equal to 1")
+    if ai_max_concurrency < 1:
+        raise ValueError("AI_MAX_CONCURRENCY must be greater than or equal to 1")
+    if ai_max_attempts_per_job < 1:
+        raise ValueError(
+            "AI_MAX_ATTEMPTS_PER_JOB must be greater than or equal to 1"
+        )
     if ai_retry_base_seconds < 0:
         raise ValueError("AI_RETRY_BASE_SECONDS must be greater than or equal to 0")
     if ai_retry_max_seconds < ai_retry_base_seconds:
@@ -199,13 +210,13 @@ def get_settings() -> Settings:
             temperature=_float("GEMMA_TEMPERATURE", 1.0),
             top_p=_float("GEMMA_TOP_P", 0.95),
             top_k=_int("GEMMA_TOP_K", 64),
-            target_rpm=_int("AI_TARGET_RPM", 25),
-            max_concurrency=_int("AI_MAX_CONCURRENCY", 25),
+            target_rpm=ai_target_rpm,
+            max_concurrency=ai_max_concurrency,
             provider_tpm=_int("AI_PROVIDER_TPM", 16000),
             tpm_safety_factor=_float("AI_TPM_SAFETY_FACTOR", 0.90),
             chars_per_token_estimate=_float("AI_CHARS_PER_TOKEN_ESTIMATE", 3.5),
             max_jobs_per_run=_int("AI_MAX_JOBS_PER_RUN", 0),
-            max_attempts_per_job=_int("AI_MAX_ATTEMPTS_PER_JOB", 3),
+            max_attempts_per_job=ai_max_attempts_per_job,
             max_schema_repair_attempts=_int("AI_MAX_SCHEMA_REPAIR_ATTEMPTS", 1),
             retry_base_seconds=ai_retry_base_seconds,
             retry_max_seconds=ai_retry_max_seconds,

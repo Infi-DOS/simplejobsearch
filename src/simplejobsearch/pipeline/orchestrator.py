@@ -10,6 +10,7 @@ from ..notifications.email import (
     notification_not_attempted,
     send_pipeline_complete_email,
 )
+from ..operations import recorded_task
 from ..workflow import (
     batch_job_ids,
     batch_summary,
@@ -17,6 +18,7 @@ from ..workflow import (
     now_iso,
     record_query_metrics,
     refresh_batch_counts,
+    refresh_final_review_state,
     resolve_batch,
     unfinished_ai_job_ids,
     unfinished_pipeline_job_ids,
@@ -26,6 +28,7 @@ from .ai_extractor import run_ai_extraction
 from .details import fetch_approved_details
 from .metadata_gate import run_metadata_gate
 from .post_ai import run_post_ai
+from .streaming import run_streaming_pipeline
 
 
 class PendingReviewError(RuntimeError):
@@ -60,6 +63,9 @@ class BatchTotals:
     post_ai_classified: int = 0
     ai_failed: int = 0
     unfinished: int = 0
+    final_pending: int = 0
+    final_accepted: int = 0
+    final_rejected: int = 0
 
 
 @dataclass(frozen=True)
@@ -71,6 +77,7 @@ class PipelineSummary:
     no_op: bool = False
     message: str = "Pipeline completed."
     last_error: str | None = None
+    final_review_status: str = "NOT_STARTED"
     this_run: RunActivity = RunActivity()
     batch_totals: BatchTotals = BatchTotals()
 
@@ -93,6 +100,9 @@ def _batch_totals(counts: dict) -> BatchTotals:
         post_ai_classified=shortlist + review + reject,
         ai_failed=counts.get("ai_failed_count", 0),
         unfinished=counts.get("unfinished_count", 0),
+        final_pending=counts.get("final_pending_count", 0),
+        final_accepted=counts.get("final_accepted_count", 0),
+        final_rejected=counts.get("final_rejected_count", 0),
     )
 
 
@@ -118,6 +128,13 @@ def _pipeline_summary(
             else "Pipeline completed."
         ),
         last_error=last_error,
+        final_review_status=(
+            "NOT_STARTED"
+            if status != "COMPLETE"
+            else "AWAITING_REVIEW"
+            if counts.get("final_pending_count", 0)
+            else "FINALIZED"
+        ),
         this_run=activity or RunActivity(),
         batch_totals=_batch_totals(counts),
     ).to_dict()
@@ -139,6 +156,9 @@ PERSISTED_COUNT_FIELDS = (
     "shortlist_count",
     "final_review_count",
     "reject_count",
+    "final_pending_count",
+    "final_accepted_count",
+    "final_rejected_count",
 )
 
 
@@ -155,6 +175,7 @@ def _unfinished_error(job_ids: list[str]) -> str:
     return f"{len(job_ids)} approved pipeline {noun} {verb} unfinished: {displayed}"
 
 
+@recorded_task("continue_pipeline")
 def continue_after_review(
     *,
     batch_date: date | str | None = None,
@@ -162,6 +183,7 @@ def continue_after_review(
     metadata_stage: Callable = run_metadata_gate,
     ai_stage: Callable = run_ai_extraction,
     post_ai_stage: Callable = run_post_ai,
+    streaming_stage: Callable = run_streaming_pipeline,
     email_sender: Callable = send_pipeline_complete_email,
 ) -> dict:
     """Continue one reviewed batch through the existing reusable stages."""
@@ -171,6 +193,7 @@ def continue_after_review(
         if batch["status"] == "COMPLETE":
             unfinished = unfinished_pipeline_job_ids(connection, batch["batch_id"])
             if not unfinished:
+                refresh_final_review_state(connection, batch["batch_id"])
                 return _pipeline_summary(
                     batch,
                     refresh_batch_counts(connection, batch["batch_id"]),
@@ -202,16 +225,31 @@ def continue_after_review(
         )
 
     try:
-        details = details_stage(job_ids=job_ids)
-        metadata = metadata_stage(job_ids=job_ids)
+        use_streaming = (
+            details_stage is fetch_approved_details
+            and metadata_stage is run_metadata_gate
+            and ai_stage is run_ai_extraction
+            and post_ai_stage is run_post_ai
+        )
+        if use_streaming:
+            stages = streaming_stage(job_ids=job_ids)
+            details = stages["details"]
+            metadata = stages["metadata"]
+            ai = stages["ai"]
+            post_ai = stages["post_ai"]
+        else:
+            # Dependency-injected stages retain the deterministic sequential
+            # contract used by diagnostics and unit tests.
+            details = details_stage(job_ids=job_ids)
+            metadata = metadata_stage(job_ids=job_ids)
 
-        with database() as connection:
-            ai_job_ids = unfinished_ai_job_ids(connection, batch["batch_id"])
-        ai = ai_stage(job_ids=ai_job_ids)
+            with database() as connection:
+                ai_job_ids = unfinished_ai_job_ids(connection, batch["batch_id"])
+            ai = ai_stage(job_ids=ai_job_ids)
 
-        with database() as connection:
-            post_ai_job_ids = unfinished_ai_job_ids(connection, batch["batch_id"])
-        post_ai = post_ai_stage(job_ids=post_ai_job_ids)
+            with database() as connection:
+                post_ai_job_ids = unfinished_ai_job_ids(connection, batch["batch_id"])
+            post_ai = post_ai_stage(job_ids=post_ai_job_ids)
 
         activity = RunActivity(
             details_fetched=int(details.get("fetched", 0)),
@@ -257,6 +295,15 @@ def continue_after_review(
                     pipeline_completed_at=now_iso(),
                     last_error=None,
                     **_persisted_counts(counts),
+                )
+                final_state = refresh_final_review_state(
+                    connection,
+                    batch["batch_id"],
+                )
+                counts.update(
+                    final_pending_count=final_state["pending"],
+                    final_accepted_count=final_state["accepted"],
+                    final_rejected_count=final_state["rejected"],
                 )
                 current = batch_summary(connection, batch["batch_id"])
                 if current.get("search_run_id"):
