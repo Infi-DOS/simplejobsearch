@@ -17,6 +17,7 @@ from ..workflow import (
     mark_review_state,
     now_iso,
     record_query_metrics,
+    recover_interrupted_ai_jobs,
     refresh_batch_counts,
     refresh_final_review_state,
     resolve_batch,
@@ -39,6 +40,7 @@ class PendingReviewError(RuntimeError):
 class RunActivity:
     details_fetched: int = 0
     details_failed: int = 0
+    details_unavailable: int = 0
     metadata_evaluated: int = 0
     metadata_pass: int = 0
     metadata_reject: int = 0
@@ -54,6 +56,7 @@ class RunActivity:
 @dataclass(frozen=True)
 class BatchTotals:
     details_fetched: int = 0
+    details_unavailable: int = 0
     metadata_pass: int = 0
     metadata_reject: int = 0
     ai_extracted: int = 0
@@ -91,6 +94,7 @@ def _batch_totals(counts: dict) -> BatchTotals:
     reject = counts["reject_count"]
     return BatchTotals(
         details_fetched=counts["details_fetched_count"],
+        details_unavailable=counts.get("details_unavailable_count", 0),
         metadata_pass=counts["metadata_pass_count"],
         metadata_reject=counts["metadata_reject_count"],
         ai_extracted=counts["ai_processed_count"],
@@ -190,6 +194,7 @@ def continue_after_review(
     apply_migrations()
     with database() as connection:
         batch = resolve_batch(connection, batch_date)
+        recover_interrupted_ai_jobs(connection, batch["batch_id"])
         if batch["status"] == "COMPLETE":
             unfinished = unfinished_pipeline_job_ids(connection, batch["batch_id"])
             if not unfinished:
@@ -254,6 +259,7 @@ def continue_after_review(
         activity = RunActivity(
             details_fetched=int(details.get("fetched", 0)),
             details_failed=int(details.get("failed", 0)),
+            details_unavailable=int(details.get("unavailable", 0)),
             metadata_evaluated=int(metadata.get("processed", 0)),
             metadata_pass=int(metadata.get("PASS", 0)),
             metadata_reject=int(metadata.get("REJECT", 0)),

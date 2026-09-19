@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('windows-nightly-worker', 'windows-review-worker', 'windows-pipeline-worker', 'windows-recovery-worker')]
+    [ValidateSet('windows-nightly-worker', 'windows-afternoon-quoted-search-worker', 'windows-review-worker', 'windows-pipeline-worker', 'windows-recovery-worker')]
     [string]$Command,
     [ValidatePattern('^\d{4}-\d{2}-\d{2}$')]
     [string]$BatchDate

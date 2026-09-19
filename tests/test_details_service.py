@@ -14,6 +14,11 @@ def test_detail_service_does_not_reapply_pre_description_rules(monkeypatch):
     saved = []
     job = {"job_id": "li-1"}
     monkeypatch.setattr(details, "connect", lambda: FakeConnection())
+    monkeypatch.setattr(
+        details.legacy,
+        "finalize_exhausted_failures",
+        lambda *_args, **_kwargs: 0,
+    )
     queue_arguments = {}
     monkeypatch.setattr(
         details.legacy,
@@ -45,6 +50,51 @@ def test_detail_service_does_not_reapply_pre_description_rules(monkeypatch):
     assert result["fetched"] == 1
     assert result["failed"] == 0
     assert queue_arguments["job_ids"] == ("li-1",)
+
+
+def test_missing_listing_is_terminal_without_stopping_later_jobs(monkeypatch):
+    unavailable = []
+    fetched = []
+    jobs = [{"job_id": "li-empty"}, {"job_id": "li-good"}]
+    monkeypatch.setattr(details, "connect", lambda: FakeConnection())
+    monkeypatch.setattr(
+        details.legacy,
+        "finalize_exhausted_failures",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        details.legacy,
+        "load_detail_queue",
+        lambda *_args, **_kwargs: jobs,
+    )
+    monkeypatch.setattr(details.legacy, "mark_attempt", lambda *_args: None)
+    monkeypatch.setattr(
+        details.legacy,
+        "save_unavailable",
+        lambda _connection, job_id, _reason: unavailable.append(job_id),
+    )
+    monkeypatch.setattr(
+        details.legacy,
+        "save_success",
+        lambda _connection, job_id, _payload: fetched.append(job_id),
+    )
+
+    result = details.fetch_approved_details(
+        job_ids=["li-empty", "li-good"],
+        client_factory=lambda: object(),
+        fetcher=lambda _client, job_id: (
+            {} if job_id == "li-empty" else {"description": "Available"}
+        ),
+        wait=lambda: None,
+    )
+
+    assert unavailable == ["li-empty"]
+    assert fetched == ["li-good"]
+    assert result["processed"] == 2
+    assert result["failed"] == 1
+    assert result["unavailable"] == 1
+    assert result["fetched"] == 1
+    assert result["stopped_early"] is False
 
 
 def test_detail_queue_applies_batch_filter_before_limit():

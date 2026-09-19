@@ -65,6 +65,10 @@ SEARCH_DELAY_MAX = SETTINGS.search.delay_max_seconds
 # =============================================================================
 
 SEARCHES = as_legacy_searches()
+DEFAULT_SEARCH_STRATEGY = (
+    "five_categories_netherlands_switzerland+pipeline_rules_v1+new_jobs_only"
+)
+SEARCH_STRATEGY = DEFAULT_SEARCH_STRATEGY
 
 
 # =============================================================================
@@ -535,7 +539,7 @@ def create_search_run(
             ", ".join(countries) or LOCATION,
             HOURS_OLD,
 
-            "five_categories_netherlands_switzerland+pipeline_rules_v1+new_jobs_only",
+            SEARCH_STRATEGY,
 
             "RUNNING",
             None,

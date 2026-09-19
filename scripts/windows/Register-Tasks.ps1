@@ -1,13 +1,15 @@
 [CmdletBinding()]
 param(
     [string]$NightlyTaskName = 'JobSimpleSearch-Nightly',
+    [string]$AfternoonQuotedSearchTaskName = 'JobSimpleSearch-AfternoonQuotedSearch',
     [string]$ReminderTaskName = 'JobSimpleSearch-ReviewReminder',
     [string]$PipelineTaskName = 'JobSimpleSearch-Continue',
     [string]$PortalStopTaskName = 'JobSimpleSearch-ClosePortal',
     [string]$RecoveryTaskName = 'JobSimpleSearch-Recovery',
     [ValidateRange(0, 60)]
     [int]$PortalShutdownDelaySeconds = 3,
-    [string]$NightlyAt = '22:30'
+    [string]$NightlyAt = '22:30',
+    [string]$AfternoonQuotedSearchAt = '16:00'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,6 +51,17 @@ $nightlyTask = New-ScheduledTask `
     -Description 'Search jobs, start the review portal, then send the search email.'
 Register-ScheduledTask -TaskName $NightlyTaskName -InputObject $nightlyTask -Force | Out-Null
 
+$afternoonQuotedSearchTask = New-ScheduledTask `
+    -Action (New-ScriptAction -ScriptName 'Run-AfternoonQuotedSearch.ps1') `
+    -Trigger (New-ScheduledTaskTrigger -Daily -At $AfternoonQuotedSearchAt) `
+    -Principal $principal `
+    -Settings $settings `
+    -Description 'Repeat all ten searches with exact-phrase quotes and merge into the current review batch.'
+Register-ScheduledTask `
+    -TaskName $AfternoonQuotedSearchTaskName `
+    -InputObject $afternoonQuotedSearchTask `
+    -Force | Out-Null
+
 $reminderTask = New-ScheduledTask `
     -Action (New-ScriptAction -ScriptName 'Run-ReviewReminder.ps1') `
     -Trigger (New-ScheduledTaskTrigger -Daily -At '08:00') `
@@ -84,6 +97,7 @@ $recoveryTask = New-ScheduledTask `
 Register-ScheduledTask -TaskName $RecoveryTaskName -InputObject $recoveryTask -Force | Out-Null
 
 Write-Output "Registered $NightlyTaskName at $NightlyAt"
+Write-Output "Registered $AfternoonQuotedSearchTaskName at $AfternoonQuotedSearchAt"
 Write-Output "Registered $ReminderTaskName at 08:00"
 Write-Output "Registered on-demand task $PipelineTaskName"
 Write-Output "Registered on-demand task $PortalStopTaskName"

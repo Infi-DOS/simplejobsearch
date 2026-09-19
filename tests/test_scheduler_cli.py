@@ -214,14 +214,70 @@ def test_review_reminder_completes_when_email_is_disabled(monkeypatch):
     assert result["notification"]["sent"] is False
 
 
-def test_scheduler_registers_only_nightly_and_review_jobs():
+def test_afternoon_quoted_search_uses_all_exact_queries_and_current_date(monkeypatch):
+    events = []
+
+    @contextmanager
+    def available_pipeline():
+        yield True
+
+    monkeypatch.setattr(tasks, "apply_migrations", list)
+    monkeypatch.setattr(tasks, "task_lock", lambda _name: available_pipeline())
+    monkeypatch.setattr(
+        tasks,
+        "get_settings",
+        lambda: SimpleNamespace(timezone=ZoneInfo("Europe/Amsterdam")),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "afternoon_quoted_searches",
+        lambda: [
+            {
+                "name": "ai_exact",
+                "family": "AI",
+                "query": '"artificial intelligence"',
+                "country": "Netherlands",
+                "location": "Netherlands",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        tasks,
+        "run_daily_search",
+        lambda **kwargs: events.append(kwargs)
+        or {"batch_id": 12, "status": "WAITING_FOR_REVIEW"},
+    )
+    monkeypatch.setattr(tasks, "send_search_complete_email", lambda _summary: False)
+
+    result = tasks.afternoon_quoted_search_task.__wrapped__(
+        batch_date=date(2026, 9, 19)
+    )
+
+    assert events[0]["batch_date"] == date(2026, 9, 19)
+    assert events[0]["searches"][0]["query"] == '"artificial intelligence"'
+    assert events[0]["search_strategy"].startswith("quoted_five_categories_")
+    assert result["task"] == "afternoon_quoted_search"
+    assert result["task_status"] == "COMPLETED"
+
+
+def test_scheduler_registers_daily_searches_and_review_job():
     service = scheduler.build_scheduler()
     jobs = {job.id: job for job in service.get_jobs()}
 
-    assert set(jobs) == {"daily_discovery", "review_reminder"}
+    assert set(jobs) == {
+        "daily_discovery",
+        "afternoon_quoted_discovery",
+        "review_reminder",
+    }
     assert jobs["daily_discovery"].func is tasks.nightly_search_task
+    assert (
+        jobs["afternoon_quoted_discovery"].func
+        is tasks.afternoon_quoted_search_task
+    )
     assert jobs["review_reminder"].func is tasks.morning_review_reminder_task
     assert "hour='22'" in str(jobs["daily_discovery"].trigger)
     assert "minute='30'" in str(jobs["daily_discovery"].trigger)
+    assert "hour='16'" in str(jobs["afternoon_quoted_discovery"].trigger)
+    assert "minute='0'" in str(jobs["afternoon_quoted_discovery"].trigger)
     assert "hour='8'" in str(jobs["review_reminder"].trigger)
     assert "minute='0'" in str(jobs["review_reminder"].trigger)

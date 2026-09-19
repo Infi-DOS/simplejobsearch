@@ -45,8 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Windows task: search, ensure portal availability, then send email",
     )
     commands.add_parser(
+        "windows-afternoon-quoted-search-worker",
+        help="Windows task: rerun all ten searches with exact-phrase quotes at 16:00",
+    )
+    commands.add_parser(
         "windows-review-worker",
         help="Windows task: ensure portal availability, then send the reminder",
+    )
+    commands.add_parser(
+        "windows-search-again-worker",
+        help="Windows task: force fresh discovery and keep the review portal online",
     )
     pipeline_worker = commands.add_parser(
         "windows-pipeline-worker",
@@ -120,10 +128,22 @@ def main(argv: list[str] | None = None) -> int:
         result = run_windows_nightly_worker()
         print(json.dumps(result, indent=2, default=str))
         return result_exit_code(result)
+    elif args.command == "windows-afternoon-quoted-search-worker":
+        from .windows_automation import run_windows_afternoon_quoted_search_worker
+
+        result = run_windows_afternoon_quoted_search_worker()
+        print(json.dumps(result, indent=2, default=str))
+        return result_exit_code(result)
     elif args.command == "windows-review-worker":
         from .windows_automation import run_windows_review_worker
 
         result = run_windows_review_worker()
+        print(json.dumps(result, indent=2, default=str))
+        return result_exit_code(result)
+    elif args.command == "windows-search-again-worker":
+        from .windows_automation import run_windows_search_again_worker
+
+        result = run_windows_search_again_worker()
         print(json.dumps(result, indent=2, default=str))
         return result_exit_code(result)
     elif args.command == "windows-pipeline-worker":

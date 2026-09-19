@@ -15,15 +15,16 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field, ValidationError
 
+from post_ai_engine import (
+    derive_ai_data_hybrid,
+    evaluate_and_persist_post_ai,
+)
 from simplejobsearch.config import get_settings
 from simplejobsearch.db import connect as shared_connect
 from simplejobsearch.pipeline.retry import (
     is_transient_ai_error,
+    provider_retry_after_seconds,
     retry_delay_seconds,
-)
-from post_ai_engine import (
-    derive_ai_data_hybrid,
-    evaluate_and_persist_post_ai,
 )
 
 # =============================================================================
@@ -37,6 +38,7 @@ TIMEZONE = SETTINGS.timezone
 
 # Direct Google GenAI SDK model ID: no "gemini/" LiteLLM prefix.
 MODEL = SETTINGS.ai.model
+FALLBACK_MODEL = SETTINGS.ai.fallback_model
 
 # Gemma 4 supports HIGH or MINIMAL through the Gemini API.
 #
@@ -88,6 +90,7 @@ CHARS_PER_TOKEN_ESTIMATE = SETTINGS.ai.chars_per_token_estimate
 # provider-request budget for each explicit extraction invocation; the stored
 # ai_attempt_count remains cumulative telemetry across invocations.
 MAX_ATTEMPTS_PER_JOB = SETTINGS.ai.max_attempts_per_job
+FALLBACK_MAX_ATTEMPTS_PER_JOB = SETTINGS.ai.fallback_max_attempts_per_job
 MAX_SCHEMA_REPAIR_ATTEMPTS = SETTINGS.ai.max_schema_repair_attempts
 AI_RETRY_BASE_SECONDS = SETTINGS.ai.retry_base_seconds
 AI_RETRY_MAX_SECONDS = SETTINGS.ai.retry_max_seconds
@@ -566,6 +569,12 @@ class RollingRateHandler:
 
         self.lock = asyncio.Lock()
 
+        # Provider errors are shared-account signals, not isolated job state.
+        # A quota response pauses every future acquisition. Repeated server or
+        # transport errors also open this lightweight circuit breaker.
+        self.cooldown_until = 0.0
+        self.consecutive_provider_failures = 0
+
         self.concurrency = (
             asyncio.Semaphore(
                 max_concurrency
@@ -629,6 +638,11 @@ class RollingRateHandler:
                         now
                     )
 
+                    cooldown_ok = (
+                        now
+                        >= self.cooldown_until
+                    )
+
                     rpm_ok = (
                         len(
                             self.request_times
@@ -647,7 +661,11 @@ class RollingRateHandler:
                         <= self.input_tpm
                     )
 
-                    if rpm_ok and tpm_ok:
+                    if (
+                        cooldown_ok
+                        and rpm_ok
+                        and tpm_ok
+                    ):
 
                         reservation = (
                             TokenReservation(
@@ -669,6 +687,13 @@ class RollingRateHandler:
                         return reservation
 
                     waits = []
+
+                    if not cooldown_ok:
+
+                        waits.append(
+                            self.cooldown_until
+                            - now
+                        )
 
                     if not rpm_ok:
 
@@ -730,6 +755,32 @@ class RollingRateHandler:
             self.concurrency.release()
 
             raise
+
+    async def record_success(
+        self,
+    ) -> None:
+
+        async with self.lock:
+
+            self.consecutive_provider_failures = 0
+
+    async def record_transient_failure(
+        self,
+        _exc: BaseException,
+        delay_seconds: float,
+    ) -> bool:
+        """Pause all provider requests after any transient provider failure."""
+
+        async with self.lock:
+
+            self.consecutive_provider_failures += 1
+
+            self.cooldown_until = max(
+                self.cooldown_until,
+                time.monotonic()
+                + max(0.0, delay_seconds),
+            )
+            return True
 
     async def reconcile(
         self,
@@ -1171,6 +1222,7 @@ async def rate_limited_generate(
     aclient,
     handler: RollingRateHandler,
     prompt: str,
+    model: str,
     on_acquired=None,
 ):
 
@@ -1197,13 +1249,15 @@ async def rate_limited_generate(
         response = (
             await aclient.models
             .generate_content(
-                model=MODEL,
+                model=model,
                 contents=prompt,
                 config=(
                     generation_config()
                 ),
             )
         )
+
+        await handler.record_success()
 
         usage = response_usage(
             response
@@ -1227,6 +1281,7 @@ async def extract_facts(
     aclient,
     handler: RollingRateHandler,
     job: sqlite3.Row,
+    model: str,
     on_request_acquired=None,
 ):
 
@@ -1239,6 +1294,7 @@ async def extract_facts(
             aclient,
             handler,
             prompt,
+            model,
             on_acquired=(
                 on_request_acquired
             ),
@@ -1286,6 +1342,7 @@ async def extract_facts(
                     aclient,
                     handler,
                     repair,
+                    model,
                     on_acquired=(
                         on_request_acquired
                     ),
@@ -1365,6 +1422,7 @@ def save_success(
     job_id: str,
     response,
     facts: JobFacts,
+    extractor_model: str,
 ) -> None:
 
     timestamp = now_local()
@@ -1630,7 +1688,7 @@ def save_success(
         (
             job_id,
             SCHEMA_VERSION,
-            MODEL,
+            extractor_model,
             PROMPT_VERSION,
 
             facts.primary_role_family,
@@ -1812,15 +1870,23 @@ async def process_job(
     # The persisted counter is lifetime telemetry. A user-triggered pipeline
     # continuation receives a new, bounded retry budget so a temporary provider
     # outage cannot make a job permanently ineligible.
-    attempts_remaining = MAX_ATTEMPTS_PER_JOB
+    active_model = MODEL
+    model_attempt_limit = MAX_ATTEMPTS_PER_JOB
+    attempts_remaining = model_attempt_limit
+    attempts_this_model = 0
     attempts_this_run = 0
     retry_number = 0
+    fallback_available = bool(
+        FALLBACK_MODEL
+        and FALLBACK_MODEL != MODEL
+    )
 
     async def on_request_acquired(
         estimated_input_tokens: int,
     ) -> None:
 
         nonlocal attempts_remaining
+        nonlocal attempts_this_model
         nonlocal attempts_this_run
 
         if attempts_remaining <= 0:
@@ -1847,12 +1913,16 @@ async def process_job(
                 connection.close()
 
         attempts_remaining -= 1
+        attempts_this_model += 1
         attempts_this_run += 1
 
         print(
             f"[{index}/{total}] SEND "
             f"{job['job_id']} | "
-            f"attempt={attempts_this_run} | "
+            f"model={active_model} | "
+            f"attempt={attempts_this_model}/"
+            f"{model_attempt_limit} | "
+            f"total_attempt={attempts_this_run} | "
             f"estimated_input≈"
             f"{estimated_input_tokens}"
         )
@@ -1866,6 +1936,7 @@ async def process_job(
                     aclient,
                     handler,
                     job,
+                    active_model,
                     on_request_acquired=(
                         on_request_acquired
                     ),
@@ -1897,10 +1968,63 @@ async def process_job(
 
                     connection.close()
 
-            if (
-                not is_transient_ai_error(exc)
-                or attempts_remaining <= 0
-            ):
+            transient = is_transient_ai_error(exc)
+            delay = None
+            cooldown_applied = False
+
+            if transient:
+                proposed_retry_number = retry_number + 1
+                retry_after = provider_retry_after_seconds(exc)
+                delay = retry_delay_seconds(
+                    proposed_retry_number,
+                    base_seconds=AI_RETRY_BASE_SECONDS,
+                    max_seconds=AI_RETRY_MAX_SECONDS,
+                    retry_after=retry_after,
+                )
+                cooldown_applied = await handler.record_transient_failure(
+                    exc,
+                    delay,
+                )
+
+                if cooldown_applied:
+                    print(
+                        f"[{index}/{total}] PROVIDER COOLDOWN "
+                        f"{delay:.1f}s | {reason}"
+                    )
+
+            if not transient:
+                print(
+                    f"[{index}/{total}] FAILED "
+                    f"{job['job_id']}: "
+                    f"{reason}"
+                )
+
+                return (
+                    "FAILED",
+                    job["job_id"],
+                )
+
+            if attempts_remaining <= 0:
+                if fallback_available and active_model == MODEL:
+                    previous_model = active_model
+                    active_model = FALLBACK_MODEL
+                    model_attempt_limit = FALLBACK_MAX_ATTEMPTS_PER_JOB
+                    attempts_remaining = model_attempt_limit
+                    attempts_this_model = 0
+                    retry_number = 0
+                    fallback_available = False
+
+                    assert delay is not None
+                    print(
+                        f"[{index}/{total}] FALLBACK "
+                        f"{job['job_id']} in {delay:.1f}s | "
+                        f"from={previous_model} | "
+                        f"to={active_model} | "
+                        f"{reason}"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
                 print(
                     f"[{index}/{total}] FAILED "
                     f"{job['job_id']}: "
@@ -1913,11 +2037,7 @@ async def process_job(
                 )
 
             retry_number += 1
-            delay = retry_delay_seconds(
-                retry_number,
-                base_seconds=AI_RETRY_BASE_SECONDS,
-                max_seconds=AI_RETRY_MAX_SECONDS,
-            )
+            assert delay is not None
             print(
                 f"[{index}/{total}] RETRY "
                 f"{job['job_id']} in {delay:.1f}s | "
@@ -1964,6 +2084,7 @@ async def process_job(
                 job["job_id"],
                 response,
                 facts,
+                active_model,
             )
 
             if run_post_ai_after_extraction:
@@ -1998,6 +2119,7 @@ async def process_job(
     print(
         f"[{index}/{total}] DONE "
         f"{job['job_id']} | "
+        f"model={active_model} | "
         f"{facts.primary_role_family} | "
         f"{facts.seniority} | "
         f"min_years="
@@ -2060,11 +2182,15 @@ async def async_main(
     print("=" * 96)
 
     print(
-        f"SDK:               google-genai"
+        "SDK:               google-genai"
     )
 
     print(
-        f"Model:             {MODEL}"
+        f"Primary model:     {MODEL}"
+    )
+
+    print(
+        f"Fallback model:    {FALLBACK_MODEL or 'disabled'}"
     )
 
     print(
@@ -2095,8 +2221,13 @@ async def async_main(
     )
 
     print(
-        f"Attempts/job/run:  "
+        f"Primary attempts:  "
         f"{MAX_ATTEMPTS_PER_JOB}"
+    )
+
+    print(
+        f"Fallback attempts: "
+        f"{FALLBACK_MAX_ATTEMPTS_PER_JOB if FALLBACK_MODEL else 'disabled'}"
     )
 
     print(
@@ -2144,17 +2275,10 @@ async def async_main(
         api_key=SETTINGS.ai.api_key
     ).aio as aclient:
 
-        tasks = [
-            asyncio.create_task(
-                process_job(
-                    aclient,
-                    handler,
-                    db_lock,
-                    job,
-                    index,
-                    len(queue),
-                    run_post_ai_after_extraction,
-                )
+        job_calls = [
+            (
+                job,
+                index,
             )
             for index, job
             in enumerate(
@@ -2163,11 +2287,43 @@ async def async_main(
             )
         ]
 
-        results = (
-            await asyncio.gather(
-                *tasks
+        if MAX_CONCURRENCY == 1:
+            # Strict serial mode: finish a job's complete bounded retry cycle
+            # before another job is allowed to send a provider request.
+            results = []
+            for job, index in job_calls:
+                results.append(
+                    await process_job(
+                        aclient,
+                        handler,
+                        db_lock,
+                        job,
+                        index,
+                        len(queue),
+                        run_post_ai_after_extraction,
+                    )
+                )
+        else:
+            tasks = [
+                asyncio.create_task(
+                    process_job(
+                        aclient,
+                        handler,
+                        db_lock,
+                        job,
+                        index,
+                        len(queue),
+                        run_post_ai_after_extraction,
+                    )
+                )
+                for job, index in job_calls
+            ]
+
+            results = (
+                await asyncio.gather(
+                    *tasks
+                )
             )
-        )
 
     extracted = sum(
         1

@@ -642,6 +642,59 @@ def save_failure(
     connection.commit()
 
 
+def save_unavailable(
+    connection: sqlite3.Connection,
+    job_id: str,
+    reason: str,
+) -> None:
+    """Persist a job-specific terminal response without stopping the batch."""
+    connection.execute(
+        """
+        UPDATE jobs
+        SET details_status = 'UNAVAILABLE',
+            details_last_error = ?
+        WHERE job_id = ?
+        """,
+        (reason, job_id),
+    )
+    connection.commit()
+
+
+def finalize_exhausted_failures(
+    connection: sqlite3.Connection,
+    *,
+    job_ids=None,
+    max_attempts: int = MAX_ATTEMPTS_PER_JOB,
+) -> int:
+    """Make exhausted detail failures terminal so they cannot block a batch."""
+    selected = tuple(dict.fromkeys(job_ids)) if job_ids is not None else None
+    if selected == ():
+        return 0
+    selected_sql = ""
+    params: list[object] = [max_attempts]
+    if selected is not None:
+        selected_sql = f"AND job_id IN ({','.join('?' for _ in selected)})"
+        params.extend(selected)
+    before = connection.total_changes
+    connection.execute(
+        f"""
+        UPDATE jobs
+        SET details_status = 'UNAVAILABLE',
+            details_last_error = COALESCE(
+                details_last_error,
+                'Detail fetch attempt limit exhausted'
+            )
+        WHERE details_status = 'FAILED_OR_EMPTY'
+          AND COALESCE(details_attempt_count, 0) >= ?
+          {selected_sql}
+        """,
+        params,
+    )
+    finalized = connection.total_changes - before
+    connection.commit()
+    return finalized
+
+
 # =============================================================================
 # SUMMARY
 # =============================================================================
@@ -777,6 +830,10 @@ def main():
     try:
         verify_database(
             connection
+        )
+
+        finalize_exhausted_failures(
+            connection,
         )
 
         queue = load_detail_queue(
@@ -928,7 +985,7 @@ def main():
                         "description/details."
                     )
 
-                    save_failure(
+                    save_unavailable(
                         connection,
                         job["job_id"],
                         reason,
@@ -937,14 +994,15 @@ def main():
                     failed += 1
                     processed += 1
 
-                    consecutive_empty += 1
+                    consecutive_empty = 0
 
                     print(
                         "EMPTY DETAILS"
                     )
 
             if (
-                consecutive_empty
+                STOP_AFTER_CONSECUTIVE_EMPTY > 0
+                and consecutive_empty
                 >= STOP_AFTER_CONSECUTIVE_EMPTY
             ):
 

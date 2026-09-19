@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ import ai_extractor as legacy
 from simplejobsearch import config
 from simplejobsearch.pipeline.retry import (
     is_transient_ai_error,
+    provider_retry_after_seconds,
     retry_delay_seconds,
 )
 
@@ -23,9 +25,20 @@ class ServerDisconnectedError(Exception):
 
 
 class ProviderError(Exception):
-    def __init__(self, status_code):
+    def __init__(self, status_code, *, details=None, response=None):
         super().__init__(f"provider returned {status_code}")
         self.status_code = status_code
+        self.details = details
+        self.response = response
+
+
+class RetryHandler:
+    def __init__(self):
+        self.failures = []
+
+    async def record_transient_failure(self, exc, delay):
+        self.failures.append((exc, delay))
+        return False
 
 
 def test_transient_retry_classification_is_selective():
@@ -50,6 +63,73 @@ def test_retry_delay_is_bounded_exponential_with_jitter():
     ) == 5
 
 
+def test_provider_retry_info_takes_precedence_and_adds_boundary_jitter():
+    exc = ProviderError(
+        429,
+        details={
+            "error": {
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "45s",
+                    }
+                ]
+            }
+        },
+    )
+
+    assert provider_retry_after_seconds(exc) == 45
+    assert retry_delay_seconds(
+        1,
+        base_seconds=15,
+        max_seconds=120,
+        retry_after=provider_retry_after_seconds(exc),
+        random_value=lambda: 0,
+    ) == 46
+    assert retry_delay_seconds(
+        1,
+        base_seconds=15,
+        max_seconds=120,
+        retry_after=provider_retry_after_seconds(exc),
+        random_value=lambda: 1,
+    ) == 48
+
+
+def test_provider_retry_after_supports_header_and_message_fallbacks():
+    header_error = ProviderError(
+        429,
+        response=SimpleNamespace(headers={"Retry-After": "20"}),
+    )
+
+    class MessageOnlyError(Exception):
+        pass
+
+    assert provider_retry_after_seconds(header_error) == 20
+    assert provider_retry_after_seconds(
+        MessageOnlyError("Please retry in 12.75s.")
+    ) == 12.75
+
+
+def test_shared_limiter_cools_down_on_every_transient_provider_failure():
+    async def scenario():
+        handler = legacy.RollingRateHandler(rpm=10, input_tpm=1000, max_concurrency=1)
+
+        assert await handler.record_transient_failure(ProviderError(500), 0.03)
+
+        started = time.monotonic()
+        await handler.acquire(1)
+        elapsed = time.monotonic() - started
+        handler.release()
+        assert elapsed >= 0.02
+
+        await handler.record_success()
+        assert handler.consecutive_provider_failures == 0
+        assert await handler.record_transient_failure(ProviderError(503), 0.01)
+        assert await handler.record_transient_failure(ProviderError(429), 0.01)
+
+    asyncio.run(scenario())
+
+
 def test_invalid_retry_configuration_fails_clearly(monkeypatch):
     monkeypatch.setenv("AI_RETRY_BASE_SECONDS", "10")
     monkeypatch.setenv("AI_RETRY_MAX_SECONDS", "5")
@@ -64,6 +144,16 @@ def test_zero_provider_attempt_budget_fails_clearly(monkeypatch):
     config.reset_settings_cache()
     try:
         with pytest.raises(ValueError, match="AI_MAX_ATTEMPTS_PER_JOB"):
+            config.get_settings()
+    finally:
+        config.reset_settings_cache()
+
+
+def test_zero_fallback_attempt_budget_fails_clearly(monkeypatch):
+    monkeypatch.setenv("AI_FALLBACK_MAX_ATTEMPTS_PER_JOB", "0")
+    config.reset_settings_cache()
+    try:
+        with pytest.raises(ValueError, match="AI_FALLBACK_MAX_ATTEMPTS_PER_JOB"):
             config.get_settings()
     finally:
         config.reset_settings_cache()
@@ -132,6 +222,7 @@ def test_transient_failure_retries_and_counts_real_provider_attempts(monkeypatch
         _aclient,
         _handler,
         _job,
+        _model,
         on_request_acquired=None,
     ):
         nonlocal calls
@@ -152,6 +243,7 @@ def test_transient_failure_retries_and_counts_real_provider_attempts(monkeypatch
         events.append("slept")
 
     monkeypatch.setattr(legacy_runtime, "MAX_ATTEMPTS_PER_JOB", 3)
+    monkeypatch.setattr(legacy_runtime, "FALLBACK_MODEL", None)
     monkeypatch.setattr(legacy_runtime, "connect_database", DummyConnection)
     monkeypatch.setattr(
         legacy_runtime,
@@ -166,7 +258,7 @@ def test_transient_failure_retries_and_counts_real_provider_attempts(monkeypatch
     monkeypatch.setattr(
         legacy_runtime,
         "save_success",
-        lambda _connection, job_id, _response, _facts: events.append(("success", job_id)),
+        lambda _connection, job_id, _response, _facts, _model: events.append(("success", job_id)),
     )
     monkeypatch.setattr(legacy_runtime, "extract_facts", fake_extract)
     monkeypatch.setattr(
@@ -182,7 +274,7 @@ def test_transient_failure_retries_and_counts_real_provider_attempts(monkeypatch
     result = asyncio.run(
         legacy.process_job(
             object(),
-            object(),
+            RetryHandler(),
             asyncio.Lock(),
             {
                 "job_id": "li-retry",
@@ -205,6 +297,86 @@ def test_transient_failure_retries_and_counts_real_provider_attempts(monkeypatch
     assert sum(isinstance(event, tuple) and event[0] == "failure" for event in events) == 1
     assert ("success", "li-retry") in events
     assert "slept" in events
+
+
+def test_transient_failures_switch_to_fallback_after_primary_budget(monkeypatch):
+    primary_model = "gemma-4-31b-it"
+    fallback_model = "gemma-4-26b-a4b-it"
+    models = []
+    saved_models = []
+
+    class DummyConnection:
+        def close(self):
+            pass
+
+    async def fake_extract(
+        _aclient,
+        _handler,
+        _job,
+        model,
+        on_request_acquired=None,
+    ):
+        models.append(model)
+        await on_request_acquired(123)
+        if model == primary_model:
+            raise ProviderError(503)
+        facts = SimpleNamespace(
+            primary_role_family="machine_learning",
+            seniority="entry",
+            minimum_years_experience=None,
+            student_status_required=False,
+            languages_required=["English"],
+        )
+        return object(), facts
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(legacy_runtime, "MODEL", primary_model)
+    monkeypatch.setattr(legacy_runtime, "FALLBACK_MODEL", fallback_model)
+    monkeypatch.setattr(legacy_runtime, "MAX_ATTEMPTS_PER_JOB", 3)
+    monkeypatch.setattr(legacy_runtime, "FALLBACK_MAX_ATTEMPTS_PER_JOB", 3)
+    monkeypatch.setattr(legacy_runtime, "connect_database", DummyConnection)
+    monkeypatch.setattr(legacy_runtime, "mark_attempt", lambda *_args: None)
+    monkeypatch.setattr(legacy_runtime, "save_failure", lambda *_args: None)
+    monkeypatch.setattr(
+        legacy_runtime,
+        "save_success",
+        lambda _connection, _job_id, _response, _facts, model: saved_models.append(
+            model
+        ),
+    )
+    monkeypatch.setattr(legacy_runtime, "extract_facts", fake_extract)
+    monkeypatch.setattr(
+        legacy_runtime,
+        "response_usage",
+        lambda _response: {"input_tokens": 1, "output_tokens": 2, "thought_tokens": 3},
+    )
+    monkeypatch.setattr(
+        legacy_runtime, "retry_delay_seconds", lambda *_args, **_kwargs: 0
+    )
+    monkeypatch.setattr(legacy_runtime.asyncio, "sleep", no_sleep)
+
+    result = asyncio.run(
+        legacy.process_job(
+            object(),
+            RetryHandler(),
+            asyncio.Lock(),
+            {
+                "job_id": "li-fallback",
+                "title": "ML Engineer",
+                "company": "Example",
+                "ai_attempt_count": 0,
+            },
+            1,
+            1,
+            run_post_ai_after_extraction=False,
+        )
+    )
+
+    assert result == ("EXTRACTED", "li-fallback")
+    assert models == [primary_model, primary_model, primary_model, fallback_model]
+    assert saved_models == [fallback_model]
 
 
 def test_historical_attempts_get_fresh_bounded_budget_and_stay_cumulative(
@@ -241,6 +413,7 @@ def test_historical_attempts_get_fresh_bounded_budget_and_stay_cumulative(
         _aclient,
         _handler,
         _job,
+        _model,
         on_request_acquired=None,
     ):
         nonlocal calls
@@ -252,6 +425,7 @@ def test_historical_attempts_get_fresh_bounded_budget_and_stay_cumulative(
         return None
 
     monkeypatch.setattr(legacy_runtime, "MAX_ATTEMPTS_PER_JOB", 3)
+    monkeypatch.setattr(legacy_runtime, "FALLBACK_MODEL", None)
     monkeypatch.setattr(legacy_runtime, "connect_database", connect_test_database)
     monkeypatch.setattr(legacy_runtime, "extract_facts", transient_failure)
     monkeypatch.setattr(
@@ -264,7 +438,7 @@ def test_historical_attempts_get_fresh_bounded_budget_and_stay_cumulative(
     result = asyncio.run(
         legacy.process_job(
             object(),
-            object(),
+            RetryHandler(),
             asyncio.Lock(),
             {
                 "job_id": "li-exhausted",
@@ -304,6 +478,7 @@ def test_deterministic_failure_is_not_retried(monkeypatch):
         _aclient,
         _handler,
         _job,
+        _model,
         on_request_acquired=None,
     ):
         await on_request_acquired(123)
@@ -322,7 +497,7 @@ def test_deterministic_failure_is_not_retried(monkeypatch):
     result = asyncio.run(
         legacy.process_job(
             object(),
-            object(),
+            RetryHandler(),
             asyncio.Lock(),
             {
                 "job_id": "li-invalid",
@@ -375,6 +550,7 @@ def test_schema_repair_is_counted_as_a_provider_attempt(monkeypatch):
         _aclient,
         _handler,
         _prompt,
+        _model,
         on_acquired=None,
     ):
         await on_acquired(100)
@@ -390,6 +566,7 @@ def test_schema_repair_is_counted_as_a_provider_attempt(monkeypatch):
             object(),
             object(),
             {},
+            legacy_runtime.MODEL,
             on_request_acquired=lambda estimated: _record_attempt(attempts, estimated),
         )
     )

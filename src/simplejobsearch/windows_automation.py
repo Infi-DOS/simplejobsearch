@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
@@ -13,13 +14,21 @@ from urllib.request import urlopen
 from .config import get_settings
 from .db import apply_migrations, database
 from .notifications.email import (
+    deliver_notification,
+    notification_not_attempted,
     send_pipeline_complete_email,
     send_review_reminder_email,
     send_search_complete_email,
 )
-from .operations import recorded_task
+from .operations import recorded_task, task_lock
 from .pipeline.orchestrator import continue_after_review
-from .scheduler.tasks import morning_review_reminder_task, nightly_search_task
+from .scheduler.tasks import (
+    afternoon_quoted_search_task,
+    morning_review_reminder_task,
+    nightly_batch_date,
+    nightly_search_task,
+)
+from .search.collector import run_daily_search
 
 LOGGER = logging.getLogger(__name__)
 
@@ -142,6 +151,40 @@ def start_pipeline_scheduled_task() -> str:
     return task_name
 
 
+def start_search_again_worker() -> dict[str, Any]:
+    """Launch forced discovery independently while keeping the portal online."""
+    _require_windows()
+    settings = get_settings()
+    log_dir = settings.project_root / "data" / "windows-runtime" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(settings.timezone).strftime("%Y%m%d-%H%M%S")
+    log_path = log_dir / f"windows-search-again-{stamp}.log"
+    creationflags = (
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(subprocess, "DETACHED_PROCESS", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    )
+    with log_path.open("a", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "simplejobsearch.cli",
+                "windows-search-again-worker",
+            ],
+            cwd=settings.project_root,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+        )
+    return {
+        "status": "STARTED",
+        "process_id": process.pid,
+        "log_path": str(log_path),
+    }
+
+
 def _send_after_portal_ready(
     sender: Callable[[Mapping[str, Any]], bool],
 ) -> Callable[[Mapping[str, Any]], bool]:
@@ -157,6 +200,56 @@ def run_windows_nightly_worker() -> dict:
     return nightly_search_task(
         email_sender=_send_after_portal_ready(send_search_complete_email),
     )
+
+
+def run_windows_afternoon_quoted_search_worker() -> dict:
+    """Run all ten searches quoted at 16:00 and keep review access online."""
+
+    return afternoon_quoted_search_task(
+        email_sender=_send_after_portal_ready(send_search_complete_email),
+    )
+
+
+@recorded_task("search_again")
+def run_windows_search_again_worker() -> dict:
+    """Force a fresh discovery run for the current review date."""
+    with task_lock("continue_pipeline") as pipeline_available:
+        if not pipeline_available:
+            return {
+                "status": "BUSY",
+                "task_status": "NO_OP",
+                "reason": "pipeline_already_running",
+                "message": "Search was not started because the pipeline is running.",
+                "notification": notification_not_attempted(
+                    "search_complete",
+                    "pipeline_already_running",
+                ),
+            }
+        try:
+            result = run_daily_search(batch_date=nightly_batch_date())
+        except Exception:
+            ensure_review_portal()
+            raise
+
+    result["task"] = "search_again"
+    if result.get("status") == "BUSY":
+        result["task_status"] = "NO_OP"
+        result["reason"] = "discovery_already_running"
+        result["notification"] = notification_not_attempted(
+            "search_complete",
+            "discovery_already_running",
+        )
+        return result
+
+    result["task_status"] = "COMPLETED"
+    result["reason"] = None
+    result["portal"] = ensure_review_portal()
+    result["notification"] = deliver_notification(
+        send_search_complete_email,
+        result,
+        notification_type="search_complete",
+    )
+    return result
 
 
 def run_windows_review_worker() -> dict:

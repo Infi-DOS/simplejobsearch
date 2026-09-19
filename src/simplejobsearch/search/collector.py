@@ -22,6 +22,8 @@ def run_daily_search(
     *,
     batch_date: date | str | None = None,
     collector: Callable[[], dict[str, Any] | None] | None = None,
+    searches: list[dict[str, str]] | None = None,
+    search_strategy: str | None = None,
 ) -> dict[str, Any]:
     """Run discovery once and persist its measurable daily workflow state."""
     apply_migrations()
@@ -41,7 +43,12 @@ def run_daily_search(
 
         from .queries import as_legacy_searches
 
-        legacy_collector.SEARCHES = as_legacy_searches()
+        legacy_collector.SEARCHES = (
+            list(searches) if searches is not None else as_legacy_searches()
+        )
+        legacy_collector.SEARCH_STRATEGY = (
+            search_strategy or legacy_collector.DEFAULT_SEARCH_STRATEGY
+        )
         collector = legacy_collector.main
 
     try:

@@ -7,9 +7,13 @@ import pytest
 from simplejobsearch import cli, config
 from simplejobsearch.pipeline import orchestrator
 from simplejobsearch.workflow import (
+    approved_prefetch_backlog_count,
+    attach_approved_prefetch_backlog,
     count_unfinished_ai_jobs,
     count_unfinished_pipeline_jobs,
     reconcile_batch_summaries,
+    recover_interrupted_ai_jobs,
+    refresh_batch_counts,
 )
 
 
@@ -37,6 +41,33 @@ def test_reconcile_finishes_batch_only_when_all_approved_jobs_are_terminal(recov
         assert tuple(row) == ("COMPLETE", 1, 1, None)
 
 
+def test_unavailable_detail_is_terminal_for_batch_completion(recovery_database):
+    path = recovery_database
+    batch_id = prepare_recovery_database(path, status="FAILED")
+    add_job(
+        path,
+        batch_id,
+        "expired-listing",
+        details="UNAVAILABLE",
+        metadata=None,
+        ai=None,
+        post_ai=None,
+    )
+    with orchestrator.database() as connection:
+        assert count_unfinished_pipeline_jobs(connection, batch_id) == 0
+        assert refresh_batch_counts(connection, batch_id)[
+            "details_unavailable_count"
+        ] == 1
+        summaries = reconcile_batch_summaries(connection)
+        row = connection.execute(
+            "SELECT status, last_error FROM daily_batches WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+
+    assert tuple(row) == ("COMPLETE", None)
+    assert summaries[0]["status"] == "COMPLETE"
+
+
 def test_reconcile_preserves_failure_before_discovery_finished(recovery_database):
     prepare_recovery_database(recovery_database, status="FAILED")
     with orchestrator.database() as connection:
@@ -57,9 +88,11 @@ def prepare_recovery_database(path, *, status: str) -> int:
         """
         CREATE TABLE jobs (
             job_id TEXT PRIMARY KEY,
+            site TEXT NOT NULL DEFAULT 'linkedin',
             classifier_status TEXT,
             human_decision TEXT,
             details_status TEXT,
+            details_attempt_count INTEGER NOT NULL DEFAULT 0,
             metadata_gate_status TEXT,
             ai_status TEXT,
             ai_attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -182,6 +215,53 @@ def empty_stage(**_kwargs):
         "SHORTLIST": 0,
         "REVIEW": 0,
     }
+
+
+def test_attach_approved_prefetch_backlog_is_scoped_and_idempotent(
+    recovery_database,
+):
+    path = recovery_database
+    batch_id = prepare_recovery_database(path, status="FAILED")
+    add_job(path, batch_id, "already-attached", details="NOT_FETCHED")
+    add_job(path, batch_id, "older-approved", details="NOT_FETCHED", attach=False)
+    add_job(path, batch_id, "already-fetched", attach=False)
+
+    with orchestrator.database() as connection:
+        assert approved_prefetch_backlog_count(
+            connection, batch_id, max_detail_attempts=3
+        ) == 1
+        assert attach_approved_prefetch_backlog(
+            connection, batch_id, max_detail_attempts=3
+        ) == 1
+        assert attach_approved_prefetch_backlog(
+            connection, batch_id, max_detail_attempts=3
+        ) == 0
+        members = {
+            row[0]
+            for row in connection.execute(
+                "SELECT job_id FROM daily_batch_jobs WHERE batch_id = ?",
+                (batch_id,),
+            )
+        }
+
+    assert members == {"already-attached", "older-approved"}
+
+
+def test_recover_interrupted_ai_job_makes_it_retryable(recovery_database):
+    path = recovery_database
+    batch_id = prepare_recovery_database(path, status="PROCESSING")
+    add_job(path, batch_id, "interrupted", ai="PROCESSING", post_ai=None)
+
+    with orchestrator.database() as connection:
+        assert recover_interrupted_ai_jobs(connection, batch_id) == 1
+        row = connection.execute(
+            "SELECT ai_status, ai_last_error FROM jobs WHERE job_id='interrupted'"
+        ).fetchone()
+
+    assert tuple(row) == (
+        "FAILED",
+        "Previous pipeline worker stopped during AI processing",
+    )
 
 
 def test_unfinished_eligible_job_prevents_complete(recovery_database):

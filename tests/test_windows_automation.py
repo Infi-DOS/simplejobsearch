@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from datetime import date
 from io import BytesIO
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from simplejobsearch import config, windows_automation
 
@@ -117,6 +120,78 @@ def test_start_pipeline_scheduled_task_uses_configured_name(monkeypatch):
         "JobSimpleSearch-Test",
     ]
     assert calls[0][1]["check"] is True
+
+
+def test_start_search_again_worker_is_detached_and_logged(monkeypatch, tmp_path):
+    calls = []
+    fake_settings = SimpleNamespace(
+        project_root=tmp_path,
+        timezone=ZoneInfo("Europe/Amsterdam"),
+    )
+
+    class FakeProcess:
+        pid = 4321
+
+    monkeypatch.setattr(windows_automation, "_require_windows", lambda: None)
+    monkeypatch.setattr(windows_automation, "get_settings", lambda: fake_settings)
+    monkeypatch.setattr(
+        windows_automation.subprocess,
+        "Popen",
+        lambda command, **kwargs: calls.append((command, kwargs)) or FakeProcess(),
+    )
+
+    result = windows_automation.start_search_again_worker()
+
+    assert result["status"] == "STARTED"
+    assert result["process_id"] == 4321
+    assert calls[0][0][-1] == "windows-search-again-worker"
+    assert calls[0][1]["stdin"] is windows_automation.subprocess.DEVNULL
+    assert result["log_path"].endswith(".log")
+
+
+def test_search_again_worker_forces_discovery_for_current_review_date(monkeypatch):
+    events = []
+
+    @contextmanager
+    def available_pipeline():
+        yield True
+
+    monkeypatch.setattr(
+        windows_automation,
+        "task_lock",
+        lambda _name: available_pipeline(),
+    )
+    monkeypatch.setattr(
+        windows_automation,
+        "nightly_batch_date",
+        lambda: date(2026, 9, 18),
+    )
+    monkeypatch.setattr(
+        windows_automation,
+        "run_daily_search",
+        lambda **kwargs: events.append(("search", kwargs))
+        or {"status": "WAITING_FOR_REVIEW", "batch_id": 31},
+    )
+    monkeypatch.setattr(
+        windows_automation,
+        "ensure_review_portal",
+        lambda: events.append(("portal", {})) or {"status": "ALREADY_RUNNING"},
+    )
+    monkeypatch.setattr(
+        windows_automation,
+        "deliver_notification",
+        lambda _sender, summary, **_kwargs: events.append(("email", summary))
+        or {"status": "SENT"},
+    )
+
+    result = windows_automation.run_windows_search_again_worker.__wrapped__()
+
+    assert events[0] == ("search", {"batch_date": date(2026, 9, 18)})
+    assert events[1][0] == "portal"
+    assert events[2][0] == "email"
+    assert result["task"] == "search_again"
+    assert result["task_status"] == "COMPLETED"
+    assert result["notification"] == {"status": "SENT"}
 
 
 def test_portal_shutdown_uses_independent_scheduled_task(monkeypatch):

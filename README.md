@@ -11,9 +11,10 @@ service functions.
 The first human gate remains before description fetching: review the title and
 choose KEEP or EXCLUDE. During continuation, LinkedIn details are fetched
 sequentially, but every successful fetch immediately flows through metadata and
-into a shared asynchronous Gemma worker pool. The workers reuse one rolling
-RPM/TPM limiter and run Post-AI rules immediately after each extraction, so AI
-work overlaps later detail requests without increasing the provider limits.
+into a shared asynchronous Gemma queue. The queue reuses one rolling RPM/TPM
+limiter and, by default, finishes each provider call before launching the next.
+Post-AI rules run immediately after each extraction, so AI work can still
+overlap later detail requests without overlapping Gemini calls.
 
 Post-AI proposes `SHORTLIST`, `REVIEW`, or `REJECT`; none of these automated
 outcomes is the final human decision. Every extracted and classified job enters
@@ -43,24 +44,37 @@ detail fetching and metadata evaluation, and every metadata pass has a terminal
 `DETAILS_MAX_JOBS_PER_RUN=0` to process all eligible jobs in one continuation;
 use a positive value only when a per-run cap is wanted. Transient provider
 failures receive up to `AI_MAX_ATTEMPTS_PER_JOB` provider requests in each
-explicit continuation, with bounded exponential backoff and jitter. The stored
+explicit continuation on the primary model, with bounded exponential backoff
+and jitter. If a distinct `JOB_AI_FALLBACK_MODEL` is configured, exhausting
+that budget with transient failures switches the same job to the fallback for
+up to `AI_FALLBACK_MAX_ATTEMPTS_PER_JOB` requests. The stored
 `ai_attempt_count` remains cumulative lifetime telemetry; it does not
 permanently disqualify a failed job from a later continuation. A later explicit
 continuation re-admits unfinished `FAILED` rows regardless of the previous error
 classification. Within one invocation, only transient failures are retried by
 the retry loop; configured schema-repair requests count against the same
 provider-request budget. Configure the delay bounds with
-`AI_RETRY_BASE_SECONDS` and `AI_RETRY_MAX_SECONDS`. If any eligible job remains
-unfinished, the batch stays `FAILED`; running `continue` again gives unfinished
-AI jobs a fresh bounded retry budget without reprocessing terminal extracted
-jobs.
+`AI_RETRY_BASE_SECONDS` and `AI_RETRY_MAX_SECONDS`. Provider `RetryInfo` and
+`Retry-After` delays take precedence over those local backoff values and pause
+the shared request limiter, so queued jobs cannot bypass a quota cooldown.
+Every transient provider, server, or transport failure pauses the shared
+limiter before another provider request. With the default concurrency of one,
+each job finishes its bounded retry cycle before the next job starts. If any
+eligible job remains unfinished, the batch stays `FAILED`; running `continue`
+again gives unfinished AI jobs a fresh bounded retry budget without
+reprocessing terminal extracted jobs.
 
 The conservative provider defaults can be overridden in `.env`:
 
 ```dotenv
 AI_TARGET_RPM=10
-AI_MAX_CONCURRENCY=4
+AI_MAX_CONCURRENCY=1
+AI_PROVIDER_TPM=16000
+AI_TPM_SAFETY_FACTOR=0.75
+JOB_AI_MODEL=gemma-4-26b-a4b-it
+JOB_AI_FALLBACK_MODEL=
 AI_MAX_ATTEMPTS_PER_JOB=3
+AI_FALLBACK_MAX_ATTEMPTS_PER_JOB=3
 AI_RETRY_BASE_SECONDS=15
 AI_RETRY_MAX_SECONDS=120
 ```

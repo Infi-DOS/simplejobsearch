@@ -71,6 +71,7 @@ def _public_base_url() -> str | None:
 class AISettings:
     api_key: str | None
     model: str
+    fallback_model: str | None
     thinking_level: str
     temperature: float
     top_p: float
@@ -82,6 +83,7 @@ class AISettings:
     chars_per_token_estimate: float
     max_jobs_per_run: int
     max_attempts_per_job: int
+    fallback_max_attempts_per_job: int
     max_schema_repair_attempts: int
     retry_base_seconds: float
     retry_max_seconds: float
@@ -121,6 +123,8 @@ class SchedulerSettings:
     enabled: bool
     search_hour: int
     search_minute: int
+    afternoon_quoted_search_hour: int
+    afternoon_quoted_search_minute: int
     reminder_hour: int
     reminder_minute: int
 
@@ -173,8 +177,11 @@ def get_settings() -> Settings:
     if thinking_level not in {"HIGH", "MINIMAL"}:
         raise ValueError("GEMMA_THINKING_LEVEL must be HIGH or MINIMAL")
     ai_target_rpm = _int("AI_TARGET_RPM", 10)
-    ai_max_concurrency = _int("AI_MAX_CONCURRENCY", 4)
+    ai_max_concurrency = _int("AI_MAX_CONCURRENCY", 1)
     ai_max_attempts_per_job = _int("AI_MAX_ATTEMPTS_PER_JOB", 3)
+    ai_fallback_max_attempts_per_job = _int(
+        "AI_FALLBACK_MAX_ATTEMPTS_PER_JOB", 3
+    )
     ai_retry_base_seconds = _float("AI_RETRY_BASE_SECONDS", 15.0)
     ai_retry_max_seconds = _float("AI_RETRY_MAX_SECONDS", 120.0)
     if ai_target_rpm < 1:
@@ -184,6 +191,10 @@ def get_settings() -> Settings:
     if ai_max_attempts_per_job < 1:
         raise ValueError(
             "AI_MAX_ATTEMPTS_PER_JOB must be greater than or equal to 1"
+        )
+    if ai_fallback_max_attempts_per_job < 1:
+        raise ValueError(
+            "AI_FALLBACK_MAX_ATTEMPTS_PER_JOB must be greater than or equal to 1"
         )
     if ai_retry_base_seconds < 0:
         raise ValueError("AI_RETRY_BASE_SECONDS must be greater than or equal to 0")
@@ -205,7 +216,14 @@ def get_settings() -> Settings:
         timezone_name=timezone_name,
         ai=AISettings(
             api_key=os.environ.get("GEMINI_API_KEY") or None,
-            model=os.environ.get("JOB_AI_MODEL", "gemma-4-31b-it"),
+            model=os.environ.get("JOB_AI_MODEL", "gemma-4-26b-a4b-it"),
+            fallback_model=(
+                os.environ.get(
+                    "JOB_AI_FALLBACK_MODEL",
+                    "",
+                ).strip()
+                or None
+            ),
             thinking_level=thinking_level,
             temperature=_float("GEMMA_TEMPERATURE", 1.0),
             top_p=_float("GEMMA_TOP_P", 0.95),
@@ -213,10 +231,11 @@ def get_settings() -> Settings:
             target_rpm=ai_target_rpm,
             max_concurrency=ai_max_concurrency,
             provider_tpm=_int("AI_PROVIDER_TPM", 16000),
-            tpm_safety_factor=_float("AI_TPM_SAFETY_FACTOR", 0.90),
+            tpm_safety_factor=_float("AI_TPM_SAFETY_FACTOR", 0.75),
             chars_per_token_estimate=_float("AI_CHARS_PER_TOKEN_ESTIMATE", 3.5),
             max_jobs_per_run=_int("AI_MAX_JOBS_PER_RUN", 0),
             max_attempts_per_job=ai_max_attempts_per_job,
+            fallback_max_attempts_per_job=ai_fallback_max_attempts_per_job,
             max_schema_repair_attempts=_int("AI_MAX_SCHEMA_REPAIR_ATTEMPTS", 1),
             retry_base_seconds=ai_retry_base_seconds,
             retry_max_seconds=ai_retry_max_seconds,
@@ -250,6 +269,12 @@ def get_settings() -> Settings:
             enabled=_bool("SCHEDULER_ENABLED", True),
             search_hour=_int("SCHEDULER_SEARCH_HOUR", 0),
             search_minute=_int("SCHEDULER_SEARCH_MINUTE", 0),
+            afternoon_quoted_search_hour=_int(
+                "SCHEDULER_AFTERNOON_QUOTED_SEARCH_HOUR", 16
+            ),
+            afternoon_quoted_search_minute=_int(
+                "SCHEDULER_AFTERNOON_QUOTED_SEARCH_MINUTE", 0
+            ),
             reminder_hour=_int("SCHEDULER_REMINDER_HOUR", 8),
             reminder_minute=_int("SCHEDULER_REMINDER_MINUTE", 0),
         ),

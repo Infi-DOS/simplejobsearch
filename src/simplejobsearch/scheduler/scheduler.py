@@ -7,7 +7,11 @@ from apscheduler.triggers.cron import CronTrigger
 
 from ..config import get_settings
 from ..db import apply_migrations
-from .tasks import morning_review_reminder_task, nightly_search_task
+from .tasks import (
+    afternoon_quoted_search_task,
+    morning_review_reminder_task,
+    nightly_search_task,
+)
 
 
 def build_scheduler() -> BlockingScheduler:
@@ -36,6 +40,16 @@ def build_scheduler() -> BlockingScheduler:
         id="review_reminder",
         replace_existing=True,
     )
+    scheduler.add_job(
+        afternoon_quoted_search_task,
+        CronTrigger(
+            hour=settings.scheduler.afternoon_quoted_search_hour,
+            minute=settings.scheduler.afternoon_quoted_search_minute,
+            timezone=settings.timezone,
+        ),
+        id="afternoon_quoted_discovery",
+        replace_existing=True,
+    )
     return scheduler
 
 
@@ -51,4 +65,3 @@ def run_scheduler() -> None:
 
 if __name__ == "__main__":
     run_scheduler()
-

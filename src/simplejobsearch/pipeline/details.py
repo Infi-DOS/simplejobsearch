@@ -21,6 +21,11 @@ def fetch_approved_details(
     settings = get_settings().search
     connection = connect()
     try:
+        finalized = legacy.finalize_exhausted_failures(
+            connection,
+            job_ids=selected,
+            max_attempts=settings.details_max_attempts_per_job,
+        )
         queue = legacy.load_detail_queue(
             connection,
             job_ids=selected,
@@ -29,12 +34,14 @@ def fetch_approved_details(
         if not queue:
             return {
                 "processed": 0, "fetched": 0, "failed": 0,
+                "unavailable": finalized,
                 "stopped_early": False, "fetched_job_ids": [], "failed_job_ids": [],
             }
 
         client = client_factory()
         summary = {
             "processed": 0, "fetched": 0, "failed": 0,
+            "unavailable": finalized,
             "stopped_early": False, "fetched_job_ids": [], "failed_job_ids": [],
         }
         consecutive_empty = 0
@@ -44,9 +51,6 @@ def fetch_approved_details(
             try:
                 details = fetcher(client, job["job_id"])
                 description = details.get("description") if details else None
-                if not description or not str(description).strip():
-                    raise ValueError("LinkedIn returned no description/details")
-                legacy.save_success(connection, job["job_id"], details)
             except Exception as exc:  # noqa: BLE001 - isolate each remote fetch
                 legacy.save_failure(
                     connection,
@@ -57,13 +61,30 @@ def fetch_approved_details(
                 summary["failed_job_ids"].append(job["job_id"])
                 consecutive_empty += 1
             else:
-                summary["fetched"] += 1
-                summary["fetched_job_ids"].append(job["job_id"])
-                consecutive_empty = 0
-                if on_fetched is not None:
-                    on_fetched(job["job_id"])
+                if not description or not str(description).strip():
+                    legacy.save_unavailable(
+                        connection,
+                        job["job_id"],
+                        "LinkedIn returned no description/details",
+                    )
+                    summary["failed"] += 1
+                    summary["unavailable"] += 1
+                    summary["failed_job_ids"].append(job["job_id"])
+                    # A missing/deleted listing is job-specific. It must not
+                    # trip the provider-outage circuit breaker for later jobs.
+                    consecutive_empty = 0
+                else:
+                    legacy.save_success(connection, job["job_id"], details)
+                    summary["fetched"] += 1
+                    summary["fetched_job_ids"].append(job["job_id"])
+                    consecutive_empty = 0
+                    if on_fetched is not None:
+                        on_fetched(job["job_id"])
             summary["processed"] += 1
-            if consecutive_empty >= settings.details_stop_after_empty:
+            if (
+                settings.details_stop_after_empty > 0
+                and consecutive_empty >= settings.details_stop_after_empty
+            ):
                 summary["stopped_early"] = True
                 break
             if index < len(queue):

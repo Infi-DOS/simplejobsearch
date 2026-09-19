@@ -21,11 +21,14 @@ from simplejobsearch.pipeline.orchestrator import (
     continue_after_review,
 )
 from simplejobsearch.workflow import (
+    approved_prefetch_backlog_count,
+    attach_approved_prefetch_backlog,
     bootstrap_latest_batch,
     mark_review_state,
     refresh_all_final_review_states,
     resolve_batch,
     set_final_decisions,
+    unfinished_pipeline_job_ids,
 )
 
 
@@ -60,9 +63,13 @@ RECOMMENDED_JOBS_SCOPE_OPTIONS = [
 ]
 
 PREFETCH_VIEW_LABELS = {
-    "AUTO_REJECTED": "Automatic rejections",
+    "FORWARD": "Going forward",
+    "EXCLUDED": "Excluded",
+    "AUTO_KEPT": "Automatic keeps",
+    "LEARNED_EXCLUSIONS": "Learned exclusions",
+    "AUTO_REJECTED": "All automatic exclusions",
     "HUMAN_REVIEWED": "Human-reviewed",
-    "ALL": "All results",
+    "ALL": "All pre-fetch results",
 }
 
 PREFETCH_DETAILS_STATUSES = {
@@ -76,6 +83,34 @@ BATCH_SIZE_OPTIONS = [
     50,
     100,
 ]
+
+REVIEW_FILTER_COLUMNS = {
+    "title": "Job title",
+    "company": "Company",
+    "category": "Category",
+    "locations": "Locations",
+    "suggested": "Recommendation",
+    "posted": "Posted date",
+    "listings": "Listings",
+    "phd": "PhD",
+}
+
+REVIEW_EXCLUSION_RULE_OPTIONS = {
+    "company_equals": "Company - exact match",
+    "title_equals": "Job title - exact match",
+    "title_contains": "Job title - contains this title",
+}
+
+REVIEW_EXCLUSION_RULE_SPECS = {
+    "company_equals": ("company", "equals"),
+    "title_equals": ("title", "equals"),
+    "title_contains": ("title", "contains"),
+}
+
+# PRE_DESCRIPTION rules below priority 200 are evaluated before normal
+# AUTO_KEEP and REVIEW rules. Learned exclusions therefore need to live in
+# that early layer to guarantee the behavior promised by the review action.
+REVIEW_EXCLUSION_RULE_PRIORITY = 50
 
 # Pinned workflow columns are useful on a desktop, but the selection column,
 # status, and title together are wider than a typical phone viewport. AG Grid
@@ -206,6 +241,9 @@ POST_AI_ACTION_OPTIONS = [
 scope = "Latest run"
 batch_size = 25
 batch_index = 0
+review_view = "PENDING"
+review_filter_column = "title"
+review_filter_text = ""
 
 grid = None
 status_label = None
@@ -214,6 +252,8 @@ pending_jobs_label = None
 pending_groups_label = None
 visible_groups_label = None
 continue_pipeline_button = None
+continue_all_pipeline_button = None
+run_search_again_button = None
 pipeline_status_label = None
 
 # Fetched Jobs UI references
@@ -892,10 +932,34 @@ def compact_locations(
     return text
 
 
+def filter_review_rows(
+    rows: list[dict],
+    selected_column: str,
+    search_text: str,
+) -> list[dict]:
+    """Return rows whose selected display column contains the search text."""
+    query = str(search_text or "").strip().casefold()
+    if not query:
+        return list(rows)
+
+    column = (
+        selected_column
+        if selected_column in REVIEW_FILTER_COLUMNS
+        else "title"
+    )
+    return [
+        row
+        for row in rows
+        if query in str(row.get(column, "") or "").casefold()
+    ]
+
+
 def load_pending_groups(
     requested_scope: str,
     requested_batch_size: int,
     requested_batch_index: int,
+    requested_filter_column: str = "title",
+    requested_filter_text: str = "",
 ) -> dict:
 
     connection = connect_database()
@@ -971,6 +1035,7 @@ def load_pending_groups(
             "run_id": run_id,
             "total_pending_jobs": 0,
             "total_pending_groups": 0,
+            "total_matching_groups": 0,
             "batch_count": 1,
             "batch_index": 0,
             "rows": [],
@@ -1163,13 +1228,27 @@ def load_pending_groups(
         )
     )
 
+    all_grouped_rows = grouped.to_dict(
+        orient="records"
+    )
+
     total_pending_groups = len(
-        grouped
+        all_grouped_rows
+    )
+
+    matching_rows = filter_review_rows(
+        all_grouped_rows,
+        requested_filter_column,
+        requested_filter_text,
+    )
+
+    total_matching_groups = len(
+        matching_rows
     )
 
     batch_count = max(
         (
-            total_pending_groups
+            total_matching_groups
             - 1
         )
         // int(
@@ -1203,13 +1282,7 @@ def load_pending_groups(
         )
     )
 
-    visible = (
-        grouped
-        .iloc[
-            start:stop
-        ]
-        .copy()
-    )
+    visible = matching_rows[start:stop]
 
     return {
         "run_id":
@@ -1221,6 +1294,9 @@ def load_pending_groups(
         "total_pending_groups":
             total_pending_groups,
 
+        "total_matching_groups":
+            total_matching_groups,
+
         "batch_count":
             batch_count,
 
@@ -1228,9 +1304,7 @@ def load_pending_groups(
             requested_batch_index,
 
         "rows":
-            visible.to_dict(
-                orient="records"
-            ),
+            visible,
     }
 
 
@@ -1242,6 +1316,35 @@ def save_review_decisions(
     selected_rows: list[dict],
     decision: str,
 ) -> dict:
+
+    connection = connect_database()
+
+    try:
+        connection.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        result = _save_review_decisions(
+            connection,
+            selected_rows,
+            decision,
+        )
+
+        connection.commit()
+
+        return result
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+
+def _selected_review_job_ids(
+    selected_rows: list[dict],
+) -> list[str]:
 
     selected_job_ids: list[str] = []
 
@@ -1260,6 +1363,22 @@ def save_review_decisions(
         )
     )
 
+    return selected_job_ids
+
+
+def _save_review_decisions(
+    connection: sqlite3.Connection,
+    selected_rows: list[dict],
+    decision: str,
+    *,
+    event_source: str = "nicegui_app",
+    event_note: str | None = None,
+) -> dict:
+
+    selected_job_ids = _selected_review_job_ids(
+        selected_rows
+    )
+
     if not selected_job_ids:
         return {
             "saved_jobs": 0,
@@ -1267,121 +1386,106 @@ def save_review_decisions(
             "already_reviewed": 0,
         }
 
-    connection = connect_database()
-
     reviewed_at = now_local()
 
     saved_jobs = 0
     already_reviewed = 0
 
-    try:
-        connection.execute(
-            "BEGIN IMMEDIATE"
-        )
+    for job_id in (
+        selected_job_ids
+    ):
 
-        for job_id in (
-            selected_job_ids
-        ):
-
-            existing = (
-                connection.execute(
-                    """
-                    SELECT
-                        human_decision,
-                        review_category
-
-                    FROM jobs
-
-                    WHERE job_id = ?
-                    """,
-                    (
-                        job_id,
-                    ),
-                )
-                .fetchone()
-            )
-
-            if existing is None:
-                raise RuntimeError(
-                    "Job disappeared "
-                    f"from database: "
-                    f"{job_id}"
-                )
-
-            previous = (
-                existing[
-                    "human_decision"
-                ]
-            )
-
-            if previous not in (
-                None,
-                "",
-            ):
-                already_reviewed += 1
-                continue
-
+        existing = (
             connection.execute(
                 """
-                UPDATE jobs
+                SELECT
+                    human_decision,
+                    review_category
 
-                SET
-                    human_decision = ?,
-                    human_reviewed_at = ?
+                FROM jobs
 
                 WHERE job_id = ?
                 """,
                 (
-                    decision,
-                    reviewed_at,
                     job_id,
                 ),
             )
+            .fetchone()
+        )
 
-            connection.execute(
-                """
-                INSERT INTO review_events (
-                    job_id,
-                    previous_decision,
-                    decision,
-                    review_category,
-                    source,
-                    reviewer,
-                    reviewed_at,
-                    note
-                )
-
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    previous,
-                    decision,
-                    existing[
-                        "review_category"
-                    ],
-                    "nicegui_app",
-                    "local_user",
-                    reviewed_at,
-                    (
-                        f"{decision} "
-                        "applied from "
-                        "NiceGUI grouped "
-                        "Review Inbox"
-                    ),
-                ),
+        if existing is None:
+            raise RuntimeError(
+                "Job disappeared "
+                f"from database: "
+                f"{job_id}"
             )
 
-            saved_jobs += 1
+        previous = (
+            existing[
+                "human_decision"
+            ]
+        )
 
-        connection.commit()
+        if previous not in (
+            None,
+            "",
+        ):
+            already_reviewed += 1
+            continue
 
-    except Exception:
-        connection.rollback()
-        raise
+        connection.execute(
+            """
+            UPDATE jobs
 
-    finally:
-        connection.close()
+            SET
+                human_decision = ?,
+                human_reviewed_at = ?
+
+            WHERE job_id = ?
+            """,
+            (
+                decision,
+                reviewed_at,
+                job_id,
+            ),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO review_events (
+                job_id,
+                previous_decision,
+                decision,
+                review_category,
+                source,
+                reviewer,
+                reviewed_at,
+                note
+            )
+
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                previous,
+                decision,
+                existing[
+                    "review_category"
+                ],
+                event_source,
+                "local_user",
+                reviewed_at,
+                event_note
+                or (
+                    f"{decision} "
+                    "applied from "
+                    "NiceGUI grouped "
+                    "Review Inbox"
+                ),
+            ),
+        )
+
+        saved_jobs += 1
 
     return {
         "saved_jobs":
@@ -1394,6 +1498,299 @@ def save_review_decisions(
 
         "already_reviewed":
             already_reviewed,
+    }
+
+
+def review_exclusion_rule_values(
+    selected_rows: list[dict],
+    rule_mode: str,
+) -> tuple[str, str, list[str]]:
+
+    try:
+        field_name, operator = (
+            REVIEW_EXCLUSION_RULE_SPECS[
+                rule_mode
+            ]
+        )
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown future exclusion option: {rule_mode}"
+        ) from exc
+
+    values: list[str] = []
+    seen: set[str] = set()
+
+    for row in selected_rows:
+        value = str(
+            row.get(
+                field_name
+            )
+            or ""
+        ).strip()
+
+        if not value:
+            raise ValueError(
+                "Cannot create a future exclusion rule because "
+                f"a selected row has no {field_name}."
+            )
+
+        normalized = value.casefold()
+
+        if normalized in seen:
+            continue
+
+        seen.add(
+            normalized
+        )
+        values.append(
+            value
+        )
+
+    return field_name, operator, values
+
+
+def _ensure_review_exclusion_rule(
+    connection: sqlite3.Connection,
+    *,
+    field_name: str,
+    operator: str,
+    match_value: str,
+    timestamp: str,
+) -> str:
+
+    candidates = connection.execute(
+        """
+        SELECT
+            rule_id,
+            match_value,
+            priority,
+            enabled
+
+        FROM pipeline_rules
+
+        WHERE
+            stage = 'PRE_DESCRIPTION'
+            AND field_name = ?
+            AND operator = ?
+            AND action = 'AUTO_EXCLUDE'
+
+        ORDER BY
+            priority,
+            rule_id
+        """,
+        (
+            field_name,
+            operator,
+        ),
+    ).fetchall()
+
+    normalized_value = match_value.casefold()
+
+    existing = next(
+        (
+            row
+            for row in candidates
+            if str(
+                row[
+                    "match_value"
+                ]
+                or ""
+            ).strip().casefold()
+            == normalized_value
+        ),
+        None,
+    )
+
+    if existing is not None:
+        new_priority = min(
+            int(
+                existing[
+                    "priority"
+                ]
+            ),
+            REVIEW_EXCLUSION_RULE_PRIORITY,
+        )
+
+        if (
+            not int(
+                existing[
+                    "enabled"
+                ]
+            )
+            or new_priority
+            != int(
+                existing[
+                    "priority"
+                ]
+            )
+        ):
+            connection.execute(
+                """
+                UPDATE pipeline_rules
+
+                SET
+                    enabled = 1,
+                    priority = ?,
+                    updated_at = ?
+
+                WHERE rule_id = ?
+                """,
+                (
+                    new_priority,
+                    timestamp,
+                    existing[
+                        "rule_id"
+                    ],
+                ),
+            )
+            return "updated"
+
+        return "reused"
+
+    operator_label = (
+        "exact"
+        if operator == "equals"
+        else "contains"
+    )
+    rule_name = (
+        "Review exclusion: "
+        f"{field_name} {operator_label} "
+        f"{match_value}"
+    )
+    rule_key = make_unique_rule_key(
+        connection,
+        "PRE_DESCRIPTION",
+        rule_name,
+    )
+
+    connection.execute(
+        """
+        INSERT INTO pipeline_rules (
+            rule_key,
+            rule_name,
+            stage,
+            field_name,
+            operator,
+            match_value,
+            action,
+            review_category,
+            priority,
+            enabled,
+            editable,
+            source,
+            notes,
+            legacy_filter_rule_id,
+            created_at,
+            updated_at
+        )
+
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            rule_key,
+            rule_name,
+            "PRE_DESCRIPTION",
+            field_name,
+            operator,
+            match_value,
+            "AUTO_EXCLUDE",
+            None,
+            REVIEW_EXCLUSION_RULE_PRIORITY,
+            1,
+            1,
+            "review_inbox",
+            (
+                "Created by EXCLUDE + ADD RULE "
+                "in the Review Inbox."
+            ),
+            None,
+            timestamp,
+            timestamp,
+        ),
+    )
+
+    return "created"
+
+
+def exclude_and_add_review_rules(
+    selected_rows: list[dict],
+    rule_mode: str,
+) -> dict:
+
+    field_name, operator, values = (
+        review_exclusion_rule_values(
+            selected_rows,
+            rule_mode,
+        )
+    )
+
+    if not values:
+        return {
+            "saved_jobs": 0,
+            "groups": 0,
+            "already_reviewed": 0,
+            "rules_created": 0,
+            "rules_updated": 0,
+            "rules_reused": 0,
+        }
+
+    connection = connect_database()
+    timestamp = now_local()
+
+    try:
+        connection.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        result = _save_review_decisions(
+            connection,
+            selected_rows,
+            "EXCLUDE",
+            event_source="nicegui_review_rule",
+            event_note=(
+                "EXCLUDE applied from the Review Inbox and "
+                f"future {field_name} {operator} rule requested."
+            ),
+        )
+
+        rule_counts = {
+            "created": 0,
+            "updated": 0,
+            "reused": 0,
+        }
+
+        for value in values:
+            outcome = _ensure_review_exclusion_rule(
+                connection,
+                field_name=field_name,
+                operator=operator,
+                match_value=value,
+                timestamp=timestamp,
+            )
+            rule_counts[
+                outcome
+            ] += 1
+
+        connection.commit()
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+    return {
+        **result,
+        "rules_created": rule_counts[
+            "created"
+        ],
+        "rules_updated": rule_counts[
+            "updated"
+        ],
+        "rules_reused": rule_counts[
+            "reused"
+        ],
     }
 
 
@@ -1416,7 +1813,7 @@ def make_grid_options(
         "columnDefs": [
             {
                 "headerName":
-                    "Suggested",
+                    "Recommendation",
                 "field":
                     "suggested",
                 "width":
@@ -1633,7 +2030,13 @@ def _group_prefetch_rows(
             {
                 "group_key": make_group_key(company, title),
                 "decision": _one_group_value(frame["effective_decision"]),
+                "suggested": _one_group_value(frame["effective_decision"]),
                 "classifier_status": _one_group_value(frame["classifier_status"]),
+                "reason": _one_group_value(
+                    frame["review_reason"],
+                    default="—",
+                    mixed="mixed",
+                ),
                 "human_decision": _one_group_value(
                     frame["human_decision"],
                     default="—",
@@ -1678,6 +2081,8 @@ def load_prefetch_groups(
     requested_scope: str,
     requested_batch_size: int,
     requested_batch_index: int,
+    requested_filter_column: str = "title",
+    requested_filter_text: str = "",
 ) -> dict:
     if view_key not in PREFETCH_VIEW_LABELS:
         raise ValueError(f"Unknown pre-fetch view: {view_key}")
@@ -1690,7 +2095,30 @@ def load_prefetch_groups(
             "(j.details_status IS NULL OR TRIM(j.details_status) = '' "
             "OR j.details_status IN ('NOT_FETCHED', 'FAILED_OR_EMPTY'))"
         ]
-        if view_key == "AUTO_REJECTED":
+        no_human_decision = (
+            "(j.human_decision IS NULL OR TRIM(j.human_decision) = '')"
+        )
+        if view_key == "FORWARD":
+            filters.append(
+                "(j.human_decision = 'KEEP' OR "
+                f"({no_human_decision} AND j.classifier_status = 'AUTO_KEEP'))"
+            )
+        elif view_key == "EXCLUDED":
+            filters.append(
+                "(j.human_decision = 'EXCLUDE' OR "
+                f"({no_human_decision} AND j.classifier_status = 'AUTO_EXCLUDE'))"
+            )
+        elif view_key == "AUTO_KEPT":
+            filters.append("j.classifier_status = 'AUTO_KEEP'")
+        elif view_key == "LEARNED_EXCLUSIONS":
+            filters.append("j.classifier_status = 'AUTO_EXCLUDE'")
+            filters.append(
+                "EXISTS (SELECT 1 FROM pipeline_rules matched_pre_rule "
+                "WHERE j.review_reason = "
+                "'pipeline_rule:' || matched_pre_rule.rule_key "
+                "AND matched_pre_rule.source = 'review_inbox')"
+            )
+        elif view_key == "AUTO_REJECTED":
             filters.append("j.classifier_status = 'AUTO_EXCLUDE'")
         elif view_key == "HUMAN_REVIEWED":
             filters.append(
@@ -1714,6 +2142,7 @@ def load_prefetch_groups(
                 j.date_posted,
                 j.job_url,
                 j.review_category,
+                j.review_reason,
                 j.classifier_status,
                 j.suggested_action,
                 j.human_decision,
@@ -1739,8 +2168,14 @@ def load_prefetch_groups(
     grouped_rows = _group_prefetch_rows(raw)
     total_jobs = len(raw)
     total_groups = len(grouped_rows)
+    matching_rows = filter_review_rows(
+        grouped_rows,
+        requested_filter_column,
+        requested_filter_text,
+    )
+    total_matching_groups = len(matching_rows)
     batch_size_value = max(int(requested_batch_size), 1)
-    batch_count = max((total_groups - 1) // batch_size_value + 1, 1)
+    batch_count = max((total_matching_groups - 1) // batch_size_value + 1, 1)
     batch_index_value = min(max(int(requested_batch_index), 0), batch_count - 1)
     start = batch_index_value * batch_size_value
     stop = start + batch_size_value
@@ -1749,9 +2184,10 @@ def load_prefetch_groups(
         "run_id": run_id,
         "total_jobs": total_jobs,
         "total_groups": total_groups,
+        "total_matching_groups": total_matching_groups,
         "batch_count": batch_count,
         "batch_index": batch_index_value,
-        "rows": grouped_rows[start:stop],
+        "rows": matching_rows[start:stop],
     }
 
 
@@ -1883,6 +2319,7 @@ def prefetch_grid_options(
             },
             {"headerName": "Company", "field": "company", "minWidth": 180, "flex": 1},
             {"headerName": "PRE result", "field": "classifier_status", "width": 150},
+            {"headerName": "Rule / reason", "field": "reason", "minWidth": 260},
             {"headerName": "Human override", "field": "human_decision", "width": 145},
             {"headerName": "Category", "field": "category", "minWidth": 170},
             {"headerName": "Locations", "field": "locations", "minWidth": 260, "flex": 1},
@@ -5125,7 +5562,7 @@ def rules_area():
 
 def build_prefetch_panel(
     view_key: str,
-) -> None:
+):
     state = {
         "scope": "Latest run",
         "batch_size": 25,
@@ -5169,7 +5606,7 @@ def build_prefetch_panel(
                 ui.label("Listings").classes("text-sm text-gray-400")
                 ui.label(str(data["total_jobs"])).classes("text-2xl font-bold")
             with ui.card().classes("metric-card"):
-                ui.label("Review groups").classes("text-sm text-gray-400")
+                ui.label("Job groups").classes("text-sm text-gray-400")
                 ui.label(str(data["total_groups"])).classes("text-2xl font-bold")
             with ui.card().classes("metric-card"):
                 ui.label("Visible groups").classes("text-sm text-gray-400")
@@ -5179,7 +5616,7 @@ def build_prefetch_panel(
             ui.select(
                 PREFETCH_SCOPE_OPTIONS,
                 value=state["scope"],
-                label="Review scope",
+                label="Preview scope",
                 on_change=change_scope,
             ).classes("w-64")
             ui.select(
@@ -5249,8 +5686,7 @@ def build_prefetch_panel(
                 message += f", {result['locked']} locked after fetching"
             ui.notify(message, type="positive")
             panel.refresh()
-            review_grid_area.refresh()
-            refresh_continue_pipeline_state()
+            refresh_review()
 
         with ui.row().classes("w-full items-center gap-3 mobile-action-bar"):
             ui.button(
@@ -5272,18 +5708,28 @@ def build_prefetch_panel(
             ).props("unelevated").classes("btn-exclude")
 
     panel()
+    return panel.refresh
 
 
 def build_prefetch_results_tab() -> None:
     ui.label("Pre-Fetch Results").classes("text-2xl font-bold mt-2")
     ui.label(
-        "Audit and override discovery decisions before job descriptions are fetched. "
-        "Already-fetched jobs are intentionally excluded from these views."
+        "Preview every discovery decision that has not reached description fetching yet. "
+        "Automatic keeps and learned exclusions bypass the pending Review Inbox but remain "
+        "visible and overridable here. Already-fetched jobs move to Fetched Jobs."
     ).classes("text-gray-300")
 
     with ui.tabs().props("mobile-arrows align=left").classes(
         "w-full mt-2 mobile-scroll-tabs"
     ) as prefetch_tabs:
+        auto_kept_tab = ui.tab(
+            "prefetch_auto_kept",
+            label=PREFETCH_VIEW_LABELS["AUTO_KEPT"],
+        )
+        learned_exclusions_tab = ui.tab(
+            "prefetch_learned_exclusions",
+            label=PREFETCH_VIEW_LABELS["LEARNED_EXCLUSIONS"],
+        )
         auto_rejected_tab = ui.tab(
             "prefetch_auto_rejected",
             label=PREFETCH_VIEW_LABELS["AUTO_REJECTED"],
@@ -5299,8 +5745,12 @@ def build_prefetch_results_tab() -> None:
 
     with ui.tab_panels(
         prefetch_tabs,
-        value=auto_rejected_tab,
+        value=auto_kept_tab,
     ).classes("w-full bg-transparent"):
+        with ui.tab_panel(auto_kept_tab).classes("p-0"):
+            build_prefetch_panel("AUTO_KEPT")
+        with ui.tab_panel(learned_exclusions_tab).classes("p-0"):
+            build_prefetch_panel("LEARNED_EXCLUSIONS")
         with ui.tab_panel(auto_rejected_tab).classes("p-0"):
             build_prefetch_panel("AUTO_REJECTED")
         with ui.tab_panel(human_reviewed_tab).classes("p-0"):
@@ -5331,11 +5781,47 @@ def review_grid_area(
     batch_target = batch_target or batch_label
     status_target = status_target or status_label
 
-    data = load_pending_groups(
-        scope,
-        batch_size,
-        batch_index,
-    )
+    is_pending = review_view == "PENDING"
+
+    if is_pending:
+        data = load_pending_groups(
+            scope,
+            batch_size,
+            batch_index,
+            review_filter_column,
+            review_filter_text,
+        )
+        total_jobs = data[
+            "total_pending_jobs"
+        ]
+        total_groups = data[
+            "total_pending_groups"
+        ]
+        empty_scope_label = "All pending jobs"
+        grid_options = make_grid_options
+    else:
+        data = load_prefetch_groups(
+            review_view,
+            scope,
+            batch_size,
+            batch_index,
+            review_filter_column,
+            review_filter_text,
+        )
+        total_jobs = data[
+            "total_jobs"
+        ]
+        total_groups = data[
+            "total_groups"
+        ]
+        empty_scope_label = (
+            "All unfetched "
+            + PREFETCH_VIEW_LABELS[
+                review_view
+            ].casefold()
+            + " jobs"
+        )
+        grid_options = prefetch_grid_options
 
     batch_index = (
         data[
@@ -5345,17 +5831,13 @@ def review_grid_area(
 
     pending_jobs_target.set_text(
         str(
-            data[
-                "total_pending_jobs"
-            ]
+            total_jobs
         )
     )
 
     pending_groups_target.set_text(
         str(
-            data[
-                "total_pending_groups"
-            ]
+            total_groups
         )
     )
 
@@ -5377,6 +5859,11 @@ def review_grid_area(
             f"— "
             f"{len(data['rows'])} "
             f"visible groups"
+            + (
+                f" from {data['total_matching_groups']} matches"
+                if review_filter_text.strip()
+                else ""
+            )
         )
     )
 
@@ -5387,16 +5874,24 @@ def review_grid_area(
             if data[
                 "run_id"
             ]
-            else "All pending jobs"
+            else empty_scope_label
         )
     )
 
     client_grid = None
-    action_bar(lambda: client_grid)
+    if is_pending:
+        action_bar(lambda: client_grid)
+        review_exclusion_rule_bar(
+            lambda: client_grid
+        )
+    else:
+        prefetch_review_action_bar(
+            lambda: client_grid
+        )
 
     client_grid = (
         ui.aggrid(
-            make_grid_options(
+            grid_options(
                 data[
                     "rows"
                 ]
@@ -5409,7 +5904,12 @@ def review_grid_area(
             "height: 62vh;"
         )
     )
-    action_bar(lambda: client_grid)
+    if is_pending:
+        action_bar(lambda: client_grid)
+    else:
+        prefetch_review_action_bar(
+            lambda: client_grid
+        )
 
     # Retain this reference for compatibility with existing single-client
     # callers. Review actions above deliberately use their per-client grid.
@@ -5422,29 +5922,107 @@ def refresh_continue_pipeline_state():
 
     connection = connect_database()
     try:
+        pipeline_buttons = [
+            button
+            for button in (
+                continue_pipeline_button,
+                continue_all_pipeline_button,
+            )
+            if button is not None
+        ]
+        buttons = [
+            *pipeline_buttons,
+            *([run_search_again_button] if run_search_again_button is not None else []),
+        ]
+
+        def disable_all() -> None:
+            for button in buttons:
+                button.disable()
+
+        def disable_pipeline() -> None:
+            for button in pipeline_buttons:
+                button.disable()
+
+        active_tasks = {
+            str(row["task_name"])
+            for row in connection.execute(
+                """
+                SELECT task_name
+                FROM task_runs
+                WHERE status = 'RUNNING'
+                  AND task_name IN (
+                    'continue_pipeline', 'search_again',
+                    'discovery', 'nightly_search', 'afternoon_quoted_search'
+                  )
+                """
+            )
+        }
+        pipeline_running = "continue_pipeline" in active_tasks
+        search_running = bool(
+            active_tasks.intersection(
+                {
+                    "search_again",
+                    "discovery",
+                    "nightly_search",
+                    "afternoon_quoted_search",
+                }
+            )
+        )
+
+        if run_search_again_button is not None:
+            if pipeline_running or search_running:
+                run_search_again_button.disable()
+            else:
+                run_search_again_button.enable()
+
         try:
             batch = resolve_batch(connection)
         except LookupError:
-            continue_pipeline_button.disable()
+            disable_pipeline()
             pipeline_status_label.set_text(
-                "Run a daily search before continuing the pipeline."
+                "No review batch exists yet. Run Search Again to create one."
             )
             return
+
+        backlog = approved_prefetch_backlog_count(
+            connection,
+            batch["batch_id"],
+            max_detail_attempts=SETTINGS.search.details_max_attempts_per_job,
+        )
+        unfinished = len(
+            unfinished_pipeline_job_ids(
+                connection,
+                batch["batch_id"],
+            )
+        )
+        continue_pipeline_button.set_text(
+            f"Resume Current Batch ({unfinished})"
+        )
+        if continue_all_pipeline_button is not None:
+            continue_all_pipeline_button.set_text(
+                f"Process All Remaining ({unfinished + backlog})"
+            )
 
         pending = mark_review_state(
             connection,
             batch["batch_id"],
         )
-        if pending:
-            continue_pipeline_button.disable()
-            pipeline_status_label.set_text(
-                f"{pending} review decision(s) still pending for {batch['batch_date']}."
-            )
-        elif batch["status"] == "PROCESSING":
-            continue_pipeline_button.disable()
+        if pipeline_running:
+            disable_all()
             pipeline_status_label.set_text("Pipeline is currently processing.")
-        elif batch["status"] == "COMPLETE":
-            continue_pipeline_button.disable()
+        elif search_running:
+            disable_all()
+            pipeline_status_label.set_text(
+                "Search is currently running. New results will appear when it finishes."
+            )
+        elif pending:
+            disable_pipeline()
+            pipeline_status_label.set_text(
+                f"{pending} review decision(s) still pending for {batch['batch_date']}. "
+                "You may run discovery again while reviewing."
+            )
+        elif batch["status"] == "COMPLETE" and not backlog:
+            disable_pipeline()
             final_pending = int(batch["final_pending_count"] or 0)
             suffix = (
                 f" {final_pending} AI proposal(s) await Post-AI Review."
@@ -5454,26 +6032,131 @@ def refresh_continue_pipeline_state():
             pipeline_status_label.set_text(
                 f"Pipeline completed for {batch['batch_date']}.{suffix}"
             )
-        elif batch["status"] == "FAILED":
-            continue_pipeline_button.enable()
-            pipeline_status_label.set_text(
-                f"Pipeline failed for {batch['batch_date']}; continue retries unfinished work."
-            )
         else:
-            continue_pipeline_button.enable()
+            if unfinished:
+                continue_pipeline_button.enable()
+            else:
+                continue_pipeline_button.disable()
+            if continue_all_pipeline_button is not None:
+                if unfinished or backlog:
+                    continue_all_pipeline_button.enable()
+                else:
+                    continue_all_pipeline_button.disable()
+
+            if batch["status"] == "PROCESSING":
+                state_message = "The previous worker stopped"
+            elif batch["status"] == "FAILED":
+                state_message = "The previous pipeline run did not finish"
+            else:
+                state_message = "Review is complete"
             pipeline_status_label.set_text(
-                f"Review complete for {batch['batch_date']}; pipeline is ready."
+                f"{state_message}. {unfinished} current-batch job(s) remain; "
+                f"{backlog} approved pre-fetch job(s) are outside the batch."
             )
     finally:
         connection.close()
 
 
-async def continue_pipeline_from_ui():
-    continue_pipeline_button.disable()
+async def run_search_again_from_ui():
+    for button in (
+        continue_pipeline_button,
+        continue_all_pipeline_button,
+        run_search_again_button,
+    ):
+        if button is not None:
+            button.disable()
 
     if SETTINGS.windows_automation.enabled:
         pipeline_status_label.set_text(
-            "Starting the independent Windows pipeline worker..."
+            "Starting an independent fresh discovery run..."
+        )
+        try:
+            from simplejobsearch.windows_automation import start_search_again_worker
+
+            launch = start_search_again_worker()
+        except Exception as exc:
+            pipeline_status_label.set_text(
+                f"Could not start a fresh search: {exc}"
+            )
+            ui.notify(
+                f"Could not start a fresh search: {exc}",
+                type="negative",
+                timeout=10000,
+            )
+            refresh_continue_pipeline_state()
+            return
+
+        pipeline_status_label.set_text(
+            f"Fresh discovery started in process {launch['process_id']}. "
+            "The portal will remain online."
+        )
+        ui.notify(
+            "Fresh discovery started. The new review results will appear here when it finishes.",
+            type="positive",
+            timeout=8000,
+        )
+        ui.timer(2.0, refresh_continue_pipeline_state, once=True)
+        return
+
+    try:
+        from simplejobsearch.scheduler.tasks import nightly_batch_date
+        from simplejobsearch.search.collector import run_daily_search
+
+        await run.io_bound(
+            run_daily_search,
+            batch_date=nightly_batch_date(),
+        )
+    except Exception as exc:
+        pipeline_status_label.set_text(
+            f"Fresh search failed: {type(exc).__name__}: {exc}"
+        )
+        ui.notify(f"Fresh search failed: {exc}", type="negative", timeout=10000)
+    else:
+        ui.notify("Fresh search completed.", type="positive")
+        refresh_review()
+    finally:
+        refresh_continue_pipeline_state()
+
+
+async def continue_pipeline_from_ui(*, include_approved_backlog: bool = False):
+    continue_pipeline_button.disable()
+    if continue_all_pipeline_button is not None:
+        continue_all_pipeline_button.disable()
+
+    attached = 0
+    if include_approved_backlog:
+        connection = connect_database()
+        try:
+            batch = resolve_batch(connection)
+            attached = attach_approved_prefetch_backlog(
+                connection,
+                batch["batch_id"],
+                max_detail_attempts=SETTINGS.search.details_max_attempts_per_job,
+            )
+        except Exception as exc:
+            pipeline_status_label.set_text(
+                f"Could not prepare all remaining jobs: {exc}"
+            )
+            ui.notify(
+                f"Could not prepare all remaining jobs: {exc}",
+                type="negative",
+                timeout=10000,
+            )
+            refresh_continue_pipeline_state()
+            return
+        finally:
+            connection.close()
+
+        ui.notify(
+            f"Added {attached} approved pre-fetch job(s) to the resumable batch.",
+            type="positive",
+            timeout=6000,
+        )
+
+    if SETTINGS.windows_automation.enabled:
+        pipeline_status_label.set_text(
+            "Starting the independent Windows pipeline worker"
+            + (" for all remaining jobs..." if include_approved_backlog else "...")
         )
         try:
             from simplejobsearch.windows_automation import (
@@ -5484,7 +6167,6 @@ async def continue_pipeline_from_ui():
             task_name = start_pipeline_scheduled_task()
             schedule_review_portal_shutdown()
         except Exception as exc:
-            continue_pipeline_button.enable()
             pipeline_status_label.set_text(
                 f"Could not start Windows pipeline worker: {exc}"
             )
@@ -5493,6 +6175,7 @@ async def continue_pipeline_from_ui():
                 type="negative",
                 timeout=10000,
             )
+            refresh_continue_pipeline_state()
             return
 
         pipeline_status_label.set_text(
@@ -5661,11 +6344,23 @@ def previous_batch():
 def next_batch():
     global batch_index
 
-    data = load_pending_groups(
-        scope,
-        batch_size,
-        batch_index,
-    )
+    if review_view == "PENDING":
+        data = load_pending_groups(
+            scope,
+            batch_size,
+            batch_index,
+            review_filter_column,
+            review_filter_text,
+        )
+    else:
+        data = load_prefetch_groups(
+            review_view,
+            scope,
+            batch_size,
+            batch_index,
+            review_filter_column,
+            review_filter_text,
+        )
 
     if (
         batch_index
@@ -5700,6 +6395,105 @@ def batch_size_changed(event):
 
     batch_index = 0
 
+    refresh_review()
+
+
+async def apply_review_exclusion_rule(
+    rule_mode: str,
+    target_grid=None,
+):
+
+    target_grid = target_grid or grid
+    if target_grid is None:
+        return
+
+    selected = (
+        await target_grid
+        .get_selected_rows()
+    )
+
+    if not selected:
+        ui.notify(
+            "Select at least one row first.",
+            type="warning",
+        )
+        return
+
+    try:
+        result = exclude_and_add_review_rules(
+            selected,
+            rule_mode,
+        )
+
+    except Exception as exc:
+        ui.notify(
+            f"Exclude + add rule failed: {exc}",
+            type="negative",
+            timeout=8000,
+        )
+        return
+
+    rule_summary = (
+        f"{result['rules_created']} created, "
+        f"{result['rules_updated']} reactivated/promoted, "
+        f"{result['rules_reused']} already active"
+    )
+
+    ui.notify(
+        (
+            f"EXCLUDE: {result['saved_jobs']} listing(s) "
+            f"across {result['groups']} group(s); "
+            f"future rules: {rule_summary}."
+        ),
+        type="positive",
+        timeout=7000,
+    )
+
+    rules_area.refresh()
+    refresh_review()
+
+
+def review_filter_column_changed(event):
+    global review_filter_column
+    global batch_index
+
+    selected = str(event.value or "")
+    review_filter_column = (
+        selected
+        if selected in REVIEW_FILTER_COLUMNS
+        else "title"
+    )
+    batch_index = 0
+    refresh_review()
+
+
+def review_filter_text_changed(event):
+    global review_filter_text
+    global batch_index
+
+    review_filter_text = str(event.value or "")
+    batch_index = 0
+    refresh_review()
+
+
+def review_view_changed(event):
+    global review_view
+    global batch_index
+
+    selected = str(
+        event.value
+        or ""
+    ).strip().upper()
+    review_view = (
+        selected
+        if selected in {
+            "PENDING",
+            "FORWARD",
+            "EXCLUDED",
+        }
+        else "PENDING"
+    )
+    batch_index = 0
     refresh_review()
 
 
@@ -5760,6 +6554,130 @@ def action_bar(target_grid_getter=None):
             "unelevated"
         ).classes(
             "btn-exclude"
+        )
+
+
+async def apply_prefetch_review_decision(
+    decision: str,
+    target_grid=None,
+):
+
+    target_grid = target_grid or grid
+    if target_grid is None:
+        return
+
+    selected = await target_grid.get_selected_rows()
+    if not selected:
+        ui.notify(
+            "Select at least one row first.",
+            type="warning",
+        )
+        return
+
+    try:
+        result = save_prefetch_decisions(
+            selected,
+            decision,
+        )
+    except Exception as exc:
+        ui.notify(
+            f"{decision} failed: {exc}",
+            type="negative",
+            timeout=8000,
+        )
+        return
+
+    message = (
+        f"{decision}: {result['changed']} changed, "
+        f"{result['unchanged']} already set"
+    )
+    if result["locked"]:
+        message += (
+            f", {result['locked']} locked after fetching"
+        )
+    ui.notify(
+        message,
+        type="positive",
+    )
+    refresh_review()
+
+
+def prefetch_review_action_bar(target_grid_getter=None):
+
+    def current_grid():
+        return target_grid_getter() if target_grid_getter else grid
+
+    with ui.row().classes(
+        "w-full items-center gap-3 mobile-action-bar"
+    ):
+        ui.button(
+            "Select all visible",
+            on_click=lambda: select_all(current_grid()),
+        ).props("unelevated").classes("btn-neutral")
+        ui.button(
+            "Clear selection",
+            on_click=lambda: clear_selection(current_grid()),
+        ).props("unelevated").classes("btn-neutral")
+        ui.space()
+        ui.button(
+            "KEEP SELECTED",
+            on_click=lambda:
+                apply_prefetch_review_decision(
+                    "KEEP",
+                    current_grid(),
+                ),
+        ).props("unelevated").classes("btn-keep")
+        ui.button(
+            "EXCLUDE SELECTED",
+            on_click=lambda:
+                apply_prefetch_review_decision(
+                    "EXCLUDE",
+                    current_grid(),
+                ),
+        ).props("unelevated").classes("btn-exclude")
+
+
+def review_exclusion_rule_bar(target_grid_getter=None):
+
+    def current_grid():
+        return target_grid_getter() if target_grid_getter else grid
+
+    with ui.card().classes(
+        "w-full bg-slate-900/50"
+    ):
+        with ui.row().classes(
+            "w-full items-end gap-3 mobile-controls"
+        ):
+            rule_mode = ui.select(
+                REVIEW_EXCLUSION_RULE_OPTIONS,
+                value="title_equals",
+                label="Future exclusion rule",
+            ).classes(
+                "w-72"
+            )
+
+            ui.button(
+                "EXCLUDE + ADD RULE",
+                on_click=lambda:
+                    apply_review_exclusion_rule(
+                        str(
+                            rule_mode.value
+                            or ""
+                        ),
+                        current_grid(),
+                    ),
+            ).props(
+                "unelevated"
+            ).classes(
+                "btn-exclude"
+            )
+
+        ui.label(
+            "Excludes the selected rows now and teaches PRE_DESCRIPTION "
+            "to automatically exclude the same company or title in future searches. "
+            "One rule is created per unique selected value."
+        ).classes(
+            "text-sm text-gray-400"
         )
 
 
@@ -6032,7 +6950,8 @@ def _initial_ui_view(request: Request | None) -> str:
 def build_ui(request: Request | None = None) -> None:
     global grid, status_label, batch_label
     global pending_jobs_label, pending_groups_label, visible_groups_label
-    global continue_pipeline_button, pipeline_status_label
+    global continue_pipeline_button, continue_all_pipeline_button
+    global run_search_again_button, pipeline_status_label
     global fetched_grid, fetched_count_label
     global fetched_metadata_pass_label, fetched_metadata_reject_label
     global fetched_ai_pending_label, ai_extracted_grid
@@ -6402,6 +7321,9 @@ def build_ui(request: Request | None = None) -> None:
 
                 ui.label(
                     (
+                        "All three tables contain only jobs that have not been fetched yet. "
+                        "Review shows the first-rule KEEP, REVIEW, or EXCLUDE recommendation; "
+                        "strong automatic exclusions go directly to Excluded. "
                         "One listing = one LinkedIn job ID. "
                         "Near-identical listings with the same company + title "
                         "are combined into one review group. "
@@ -6411,6 +7333,27 @@ def build_ui(request: Request | None = None) -> None:
                     "text-gray-300"
                 )
 
+                with ui.tabs(
+                    value=review_view,
+                    on_change=review_view_changed,
+                ).props(
+                    "mobile-arrows align=left"
+                ).classes(
+                    "w-full mt-2 mobile-scroll-tabs"
+                ):
+                    ui.tab(
+                        "PENDING",
+                        label="Review",
+                    )
+                    ui.tab(
+                        "FORWARD",
+                        label="Going Forward",
+                    )
+                    ui.tab(
+                        "EXCLUDED",
+                        label="Excluded",
+                    )
+
                 with ui.row().classes(
                     "w-full gap-4 mobile-metric-row"
                 ):
@@ -6419,7 +7362,7 @@ def build_ui(request: Request | None = None) -> None:
                         "metric-card"
                     ):
                         ui.label(
-                            "Pending listings (LinkedIn IDs)"
+                            "Listings (LinkedIn IDs)"
                         ).classes(
                             "text-sm text-gray-400"
                         )
@@ -6435,7 +7378,7 @@ def build_ui(request: Request | None = None) -> None:
                         "metric-card"
                     ):
                         ui.label(
-                            "Pending groups (review rows)"
+                            "Job groups (table rows)"
                         ).classes(
                             "text-sm text-gray-400"
                         )
@@ -6514,6 +7457,36 @@ def build_ui(request: Request | None = None) -> None:
                         "btn-nav"
                     )
 
+                with ui.row().classes(
+                    "w-full items-end gap-4 mobile-controls"
+                ):
+
+                    ui.select(
+                        REVIEW_FILTER_COLUMNS,
+                        value=review_filter_column,
+                        label="Filter column",
+                        on_change=review_filter_column_changed,
+                    ).classes(
+                        "w-64"
+                    )
+
+                    ui.input(
+                        value=review_filter_text,
+                        label="Search selected column",
+                        placeholder="Type to show matching review groups",
+                        on_change=review_filter_text_changed,
+                    ).props(
+                        "clearable debounce=350"
+                    ).classes(
+                        "w-96"
+                    )
+
+                    ui.label(
+                        "Case-insensitive contains search across the selected table."
+                    ).classes(
+                        "text-sm text-gray-400 pb-2"
+                    )
+
                 status_label = (
                     ui.label("")
                     .classes(
@@ -6539,16 +7512,32 @@ def build_ui(request: Request | None = None) -> None:
                 with ui.card().classes(
                     "w-full mt-4"
                 ):
-                    ui.label("Continue reviewed batch").classes(
+                    ui.label("Continue pipeline").classes(
                         "text-lg font-bold"
                     )
+                    ui.label(
+                        "Resume Current Batch keeps the daily-run boundary. "
+                        "Process All Remaining also adds every older approved, "
+                        "fetchable pre-description job to this resumable batch."
+                    ).classes("text-sm text-gray-400")
                     pipeline_status_label = ui.label("").classes(
                         "text-sm text-gray-300"
                     )
-                    continue_pipeline_button = ui.button(
-                        "Continue Pipeline",
-                        on_click=continue_pipeline_from_ui,
-                    ).props("unelevated").classes("btn-keep")
+                    with ui.row().classes("w-full items-center gap-3 mobile-action-bar"):
+                        continue_pipeline_button = ui.button(
+                            "Resume Current Batch",
+                            on_click=continue_pipeline_from_ui,
+                        ).props("unelevated").classes("btn-neutral")
+                        continue_all_pipeline_button = ui.button(
+                            "Process All Remaining",
+                            on_click=lambda: continue_pipeline_from_ui(
+                                include_approved_backlog=True
+                            ),
+                        ).props("unelevated").classes("btn-keep")
+                        run_search_again_button = ui.button(
+                            "Run Search Again",
+                            on_click=run_search_again_from_ui,
+                        ).props("unelevated").classes("btn-nav")
                     refresh_continue_pipeline_state()
 
             # =====================================================================

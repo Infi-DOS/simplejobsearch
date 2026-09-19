@@ -190,6 +190,8 @@ def refresh_batch_counts(connection: sqlite3.Connection, batch_id: int) -> dict[
                       AND (j.human_decision IS NULL OR TRIM(j.human_decision) = '')
                      THEN 1 ELSE 0 END) AS review_required_count,
             SUM(CASE WHEN j.details_status = 'FETCHED' THEN 1 ELSE 0 END) AS details_fetched_count,
+            SUM(CASE WHEN j.details_status = 'UNAVAILABLE' THEN 1 ELSE 0 END)
+                AS details_unavailable_count,
             SUM(CASE WHEN j.metadata_gate_status = 'PASS' THEN 1 ELSE 0 END) AS metadata_pass_count,
             SUM(CASE WHEN j.metadata_gate_status = 'REJECT' THEN 1 ELSE 0 END) AS metadata_reject_count,
             SUM(CASE WHEN j.ai_status = 'EXTRACTED' THEN 1 ELSE 0 END) AS ai_processed_count,
@@ -211,6 +213,7 @@ def refresh_batch_counts(connection: sqlite3.Connection, batch_id: int) -> dict[
     ).fetchone()
     keys = (
         "new_job_count", "review_required_count", "details_fetched_count",
+        "details_unavailable_count",
         "metadata_pass_count", "metadata_reject_count", "ai_processed_count",
         "shortlist_count", "final_review_count", "reject_count",
         "final_pending_count", "final_accepted_count", "final_rejected_count",
@@ -276,6 +279,8 @@ def unfinished_pipeline_job_ids(
                     )
               )
               AND (
+                    UPPER(TRIM(COALESCE(j.details_status, ''))) <> 'UNAVAILABLE'
+                    AND (
                     UPPER(TRIM(COALESCE(j.details_status, ''))) <> 'FETCHED'
                     OR UPPER(TRIM(COALESCE(j.metadata_gate_status, '')))
                        NOT IN ('PASS', 'REJECT')
@@ -286,6 +291,7 @@ def unfinished_pipeline_job_ids(
                             OR TRIM(j.post_ai_status) = ''
                             OR j.post_ai_status NOT IN ({placeholders})
                         )
+                    )
                     )
               )
             ORDER BY b.observed_at, b.job_id
@@ -535,7 +541,7 @@ def reconcile_batch_summaries(connection: sqlite3.Connection) -> list[dict]:
         else:
             status = "COMPLETE" if batch["pipeline_started_at"] else "READY_TO_CONTINUE"
         values = {key: value for key, value in counts.items() if key not in {
-            "ai_failed_count", "unfinished_count",
+            "details_unavailable_count", "ai_failed_count", "unfinished_count",
         }}
         values.update(
             status=status,
@@ -617,6 +623,124 @@ def batch_job_ids(connection: sqlite3.Connection, batch_id: int) -> list[str]:
             (batch_id,),
         )
     ]
+
+
+def approved_prefetch_backlog_count(
+    connection: sqlite3.Connection,
+    batch_id: int,
+    *,
+    max_detail_attempts: int,
+) -> int:
+    """Count fetchable approved jobs that are not yet part of this batch."""
+    return int(
+        scalar(
+            connection,
+            """
+            SELECT COUNT(*)
+            FROM jobs j
+            WHERE (
+                    UPPER(TRIM(COALESCE(j.human_decision, ''))) = 'KEEP'
+                    OR (
+                        TRIM(COALESCE(j.human_decision, '')) = ''
+                        AND j.classifier_status = 'AUTO_KEEP'
+                    )
+                  )
+              AND (
+                    j.details_status IS NULL
+                    OR TRIM(j.details_status) = ''
+                    OR j.details_status IN ('NOT_FETCHED', 'FAILED_OR_EMPTY')
+                  )
+              AND LOWER(COALESCE(j.site, '')) = 'linkedin'
+              AND COALESCE(j.details_attempt_count, 0) < ?
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM daily_batch_jobs b
+                    WHERE b.batch_id = ? AND b.job_id = j.job_id
+                  )
+            """,
+            (max_detail_attempts, batch_id),
+        )
+        or 0
+    )
+
+
+def attach_approved_prefetch_backlog(
+    connection: sqlite3.Connection,
+    batch_id: int,
+    *,
+    max_detail_attempts: int,
+) -> int:
+    """Attach all fetchable approved pre-fetch jobs to one resumable batch."""
+    observed_at = now_iso()
+    before = connection.total_changes
+    connection.execute(
+        """
+        INSERT INTO daily_batch_jobs (batch_id, job_id, is_new, observed_at)
+        SELECT ?, j.job_id, 0, ?
+        FROM jobs j
+        WHERE (
+                UPPER(TRIM(COALESCE(j.human_decision, ''))) = 'KEEP'
+                OR (
+                    TRIM(COALESCE(j.human_decision, '')) = ''
+                    AND j.classifier_status = 'AUTO_KEEP'
+                )
+              )
+          AND (
+                j.details_status IS NULL
+                OR TRIM(j.details_status) = ''
+                OR j.details_status IN ('NOT_FETCHED', 'FAILED_OR_EMPTY')
+              )
+          AND LOWER(COALESCE(j.site, '')) = 'linkedin'
+          AND COALESCE(j.details_attempt_count, 0) < ?
+          AND NOT EXISTS (
+                SELECT 1
+                FROM daily_batch_jobs b
+                WHERE b.batch_id = ? AND b.job_id = j.job_id
+              )
+        """,
+        (batch_id, observed_at, max_detail_attempts, batch_id),
+    )
+    attached = connection.total_changes - before
+    connection.commit()
+    return attached
+
+
+def recover_interrupted_ai_jobs(
+    connection: sqlite3.Connection,
+    batch_id: int,
+) -> int:
+    """Make AI work abandoned in PROCESSING eligible for a safe retry."""
+    placeholders = ", ".join("?" for _ in TERMINAL_POST_AI_STATUSES)
+    job_columns = {
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in connection.execute("PRAGMA table_info(jobs)")
+    }
+    assignments = "ai_status = 'FAILED'"
+    if "ai_last_error" in job_columns:
+        assignments += (
+            ", ai_last_error = "
+            "'Previous pipeline worker stopped during AI processing'"
+        )
+    before = connection.total_changes
+    connection.execute(
+        f"""
+        UPDATE jobs
+        SET {assignments}
+        WHERE job_id IN (
+                SELECT job_id FROM daily_batch_jobs WHERE batch_id = ?
+              )
+          AND ai_status = 'PROCESSING'
+          AND (
+                post_ai_status IS NULL
+                OR TRIM(post_ai_status) = ''
+                OR post_ai_status NOT IN ({placeholders})
+              )
+        """,
+        (batch_id, *TERMINAL_POST_AI_STATUSES),
+    )
+    recovered = connection.total_changes - before
+    connection.commit()
+    return recovered
 
 
 def batch_summary(connection: sqlite3.Connection, batch_id: int) -> dict[str, Any]:

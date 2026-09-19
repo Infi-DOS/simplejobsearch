@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
+import sqlite3
 import sys
 from types import SimpleNamespace
 
@@ -170,6 +172,7 @@ def test_grid_columns_follow_workflow_order():
         "title",
         "company",
         "classifier_status",
+        "reason",
         "human_decision",
         "category",
         "locations",
@@ -249,6 +252,266 @@ def test_grid_columns_follow_workflow_order():
         "notes",
         "source",
     ]
+
+
+def test_review_filter_uses_the_chosen_column_and_is_case_insensitive():
+    from simplejobsearch.ui import views
+
+    rows = [
+        {
+            "title": "Machine Learning Engineer",
+            "company": "Example Labs",
+            "locations": "Amsterdam",
+        },
+        {
+            "title": "Data Engineer",
+            "company": "Northwind AI",
+            "locations": "Rotterdam",
+        },
+    ]
+
+    assert views.filter_review_rows(rows, "company", "NORTHWIND") == [rows[1]]
+    assert views.filter_review_rows(rows, "locations", "sterd") == [rows[0]]
+    assert views.filter_review_rows(rows, "title", "  ") == rows
+
+
+def test_review_exclusion_rule_values_are_deduplicated_case_insensitively():
+    from simplejobsearch.ui import views
+
+    rows = [
+        {"title": "Data Engineer", "company": "Example Labs"},
+        {"title": "data engineer", "company": "EXAMPLE LABS"},
+        {"title": "ML Engineer", "company": "Other Company"},
+    ]
+
+    assert views.review_exclusion_rule_values(rows, "title_equals") == (
+        "title",
+        "equals",
+        ["Data Engineer", "ML Engineer"],
+    )
+    assert views.review_exclusion_rule_values(rows, "company_equals") == (
+        "company",
+        "equals",
+        ["Example Labs", "Other Company"],
+    )
+
+
+def test_exclude_and_add_review_rules_is_atomic_and_reuses_rules(
+    tmp_path,
+    monkeypatch,
+):
+    from simplejobsearch.ui import views
+
+    database_path = tmp_path / "review-rules.db"
+
+    def connect():
+        connection = sqlite3.connect(database_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    connection = connect()
+    connection.executescript(
+        """
+        CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY,
+            human_decision TEXT,
+            human_reviewed_at TEXT,
+            review_category TEXT
+        );
+
+        CREATE TABLE review_events (
+            review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            previous_decision TEXT,
+            decision TEXT NOT NULL,
+            review_category TEXT,
+            source TEXT,
+            reviewer TEXT,
+            reviewed_at TEXT NOT NULL,
+            note TEXT
+        );
+
+        CREATE TABLE pipeline_rules (
+            rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_key TEXT NOT NULL UNIQUE,
+            rule_name TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            field_name TEXT NOT NULL,
+            operator TEXT NOT NULL,
+            match_value TEXT,
+            action TEXT NOT NULL,
+            review_category TEXT,
+            priority INTEGER NOT NULL,
+            enabled INTEGER NOT NULL,
+            editable INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            notes TEXT,
+            legacy_filter_rule_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    connection.executemany(
+        "INSERT INTO jobs (job_id, review_category) VALUES (?, ?)",
+        [("job-1", "general"), ("job-2", "general")],
+    )
+    connection.commit()
+    connection.close()
+
+    monkeypatch.setattr(views, "connect_database", connect)
+    selected = [
+        {
+            "title": "Data Engineer",
+            "company": "Example Labs",
+            "job_ids_json": json.dumps(["job-1", "job-2"]),
+        }
+    ]
+
+    first = views.exclude_and_add_review_rules(selected, "title_equals")
+
+    assert first == {
+        "saved_jobs": 2,
+        "groups": 1,
+        "already_reviewed": 0,
+        "rules_created": 1,
+        "rules_updated": 0,
+        "rules_reused": 0,
+    }
+
+    second = views.exclude_and_add_review_rules(selected, "title_equals")
+
+    assert second == {
+        "saved_jobs": 0,
+        "groups": 1,
+        "already_reviewed": 2,
+        "rules_created": 0,
+        "rules_updated": 0,
+        "rules_reused": 1,
+    }
+
+    connection = connect()
+    decisions = connection.execute(
+        "SELECT human_decision FROM jobs ORDER BY job_id"
+    ).fetchall()
+    rule = connection.execute(
+        """
+        SELECT
+            stage,
+            field_name,
+            operator,
+            match_value,
+            action,
+            priority,
+            enabled,
+            source
+        FROM pipeline_rules
+        """
+    ).fetchone()
+    event_count = connection.execute(
+        "SELECT COUNT(*) FROM review_events"
+    ).fetchone()[0]
+    connection.close()
+
+    assert [row[0] for row in decisions] == ["EXCLUDE", "EXCLUDE"]
+    assert dict(rule) == {
+        "stage": "PRE_DESCRIPTION",
+        "field_name": "title",
+        "operator": "equals",
+        "match_value": "Data Engineer",
+        "action": "AUTO_EXCLUDE",
+        "priority": views.REVIEW_EXCLUSION_RULE_PRIORITY,
+        "enabled": 1,
+        "source": "review_inbox",
+    }
+    assert event_count == 2
+
+
+def test_review_exclusion_rule_rolls_back_decisions_when_rule_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    from simplejobsearch.ui import views
+
+    database_path = tmp_path / "review-rule-rollback.db"
+
+    def connect():
+        connection = sqlite3.connect(database_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    connection = connect()
+    connection.executescript(
+        """
+        CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY,
+            human_decision TEXT,
+            human_reviewed_at TEXT,
+            review_category TEXT
+        );
+        CREATE TABLE review_events (
+            review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            previous_decision TEXT,
+            decision TEXT NOT NULL,
+            review_category TEXT,
+            source TEXT,
+            reviewer TEXT,
+            reviewed_at TEXT NOT NULL,
+            note TEXT
+        );
+        CREATE TABLE pipeline_rules (
+            rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_key TEXT NOT NULL UNIQUE,
+            rule_name TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            field_name TEXT NOT NULL,
+            operator TEXT NOT NULL,
+            match_value TEXT,
+            action TEXT NOT NULL,
+            review_category TEXT,
+            priority INTEGER NOT NULL,
+            enabled INTEGER NOT NULL,
+            editable INTEGER NOT NULL,
+            source TEXT NOT NULL CHECK (source = 'blocked'),
+            notes TEXT,
+            legacy_filter_rule_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO jobs (job_id, review_category) VALUES ('job-1', 'general');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    monkeypatch.setattr(views, "connect_database", connect)
+    selected = [
+        {
+            "title": "Data Engineer",
+            "company": "Example Labs",
+            "job_ids_json": '["job-1"]',
+        }
+    ]
+
+    try:
+        views.exclude_and_add_review_rules(selected, "title_contains")
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("Expected the rule insert to fail")
+
+    connection = connect()
+    job = connection.execute(
+        "SELECT human_decision FROM jobs WHERE job_id = 'job-1'"
+    ).fetchone()
+    event_count = connection.execute(
+        "SELECT COUNT(*) FROM review_events"
+    ).fetchone()[0]
+    connection.close()
+
+    assert job[0] is None
+    assert event_count == 0
 
 
 def test_recommended_jobs_loader_uses_only_human_kept_rows(monkeypatch):

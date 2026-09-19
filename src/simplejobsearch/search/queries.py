@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import sqlite3
+from dataclasses import dataclass
 
 from ..config import get_settings
 
@@ -83,6 +83,23 @@ SEARCH_QUERIES: tuple[SearchQuery, ...] = (
         country="Switzerland",
         location="Switzerland",
     ),
+)
+
+
+# A second discovery pass runs at 16:00 with quotes around every one of the ten
+# normal query phrases. Keep these rows disabled in the normal query table so
+# the 22:30 search does not execute them as well. The afternoon task selects
+# them explicitly and passes the quote characters all the way to JobSpy.
+AFTERNOON_QUOTED_SEARCH_QUERIES: tuple[SearchQuery, ...] = tuple(
+    SearchQuery(
+        key=f"{item.key}_exact",
+        query_text=f'"{item.query_text}"',
+        role_family=item.role_family,
+        enabled=False,
+        country=item.country,
+        location=item.location,
+    )
+    for item in SEARCH_QUERIES
 )
 
 
@@ -168,6 +185,22 @@ def as_legacy_searches(
     ]
 
 
+def afternoon_quoted_searches() -> list[dict[str, str]]:
+    """Return quoted versions of all ten searches for both markets."""
+
+    settings = get_settings().search
+    return [
+        {
+            "name": item.key,
+            "family": item.role_family,
+            "query": item.query_text,
+            "country": item.country or settings.country,
+            "location": item.location or settings.location,
+        }
+        for item in AFTERNOON_QUOTED_SEARCH_QUERIES
+    ]
+
+
 def sync_queries(
     connection: sqlite3.Connection,
     timestamp: str,
@@ -181,10 +214,11 @@ def sync_queries(
 
     settings = get_settings().search
 
-    for sort_order, item in enumerate(
-        SEARCH_QUERIES,
-        start=10,
-    ):
+    query_defaults = (
+        *SEARCH_QUERIES,
+        *AFTERNOON_QUOTED_SEARCH_QUERIES,
+    )
+    for sort_order, item in enumerate(query_defaults, start=10):
         connection.execute(
             """
             INSERT INTO search_queries (

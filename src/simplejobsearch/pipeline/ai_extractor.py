@@ -63,7 +63,9 @@ async def run_ai_job_stream_async(
     started_ids: list[str] = []
     skipped_due_limit = 0
     max_started = 1 if legacy.AI_PROBE_MODE else legacy.MAX_JOBS_PER_RUN
-    task_window = max(1, legacy.MAX_CONCURRENCY * 2)
+    # A window of one in serial mode prevents another job from using the
+    # provider while the current job is in its retry backoff.
+    task_window = max(1, legacy.MAX_CONCURRENCY)
 
     async def drain_one() -> None:
         nonlocal pending

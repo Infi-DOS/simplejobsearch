@@ -15,6 +15,7 @@ from ..notifications.email import (
 )
 from ..operations import recorded_task, task_lock
 from ..search.collector import run_daily_search
+from ..search.queries import afternoon_quoted_searches
 from ..workflow import (
     batch_summary,
     get_or_create_batch,
@@ -93,6 +94,64 @@ def nightly_search_task(
         # A direct discovery invocation may acquire the lock after our state check.
         summary["task_status"] = "NO_OP"
         return summary
+    summary["task_status"] = "COMPLETED"
+    summary["reason"] = None
+    summary["notification"] = deliver_notification(
+        email_sender or send_search_complete_email,
+        summary,
+        notification_type="search_complete",
+    )
+    return summary
+
+
+@recorded_task("afternoon_quoted_search")
+def afternoon_quoted_search_task(
+    *,
+    email_sender: Callable[[Mapping[str, Any]], bool] | None = None,
+    batch_date: date | str | None = None,
+) -> dict:
+    """Add quoted versions of all ten searches to today's batch."""
+
+    apply_migrations()
+    target_batch_date = (
+        datetime.now(get_settings().timezone).date()
+        if batch_date is None
+        else batch_date
+    )
+    with task_lock("continue_pipeline") as pipeline_available:
+        if not pipeline_available:
+            return {
+                "status": "BUSY",
+                "task_status": "NO_OP",
+                "reason": "pipeline_already_running",
+                "message": (
+                    "The 16:00 quoted search was not started because the "
+                    "pipeline is running."
+                ),
+                "notification": notification_not_attempted(
+                    "search_complete",
+                    "pipeline_already_running",
+                ),
+            }
+        summary = run_daily_search(
+            batch_date=target_batch_date,
+            searches=afternoon_quoted_searches(),
+            search_strategy=(
+                "quoted_five_categories_netherlands_switzerland"
+                "+pipeline_rules_v1+new_jobs_only"
+            ),
+        )
+
+    summary["task"] = "afternoon_quoted_search"
+    if summary.get("status") == "BUSY":
+        summary["task_status"] = "NO_OP"
+        summary["reason"] = "discovery_already_running"
+        summary["notification"] = notification_not_attempted(
+            "search_complete",
+            "discovery_already_running",
+        )
+        return summary
+
     summary["task_status"] = "COMPLETED"
     summary["reason"] = None
     summary["notification"] = deliver_notification(
