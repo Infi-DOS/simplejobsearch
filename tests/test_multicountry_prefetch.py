@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -258,6 +259,80 @@ def test_prefetch_views_and_decision_override(tmp_path, monkeypatch):
     ).fetchone()
     assert event == (None, "KEEP", "nicegui_prefetch_audit")
     connection.close()
+
+
+def test_review_scope_can_select_each_completed_run(tmp_path, monkeypatch):
+    database_path = tmp_path / "prefetch-runs.db"
+    _create_prefetch_database(database_path)
+    connection = sqlite3.connect(database_path)
+    connection.executescript(
+        """
+        INSERT INTO search_runs VALUES (
+            'run-older', '2026-08-30T00:00:00+02:00', 'SUCCESS'
+        );
+        INSERT INTO jobs VALUES (
+            'older-excluded', 'Old AI Role', 'Old Company', 'Utrecht',
+            '2026-08-30', 'https://example.test/older', 'general',
+            'pipeline_rule:base-reject', 'AUTO_EXCLUDE', 'EXCLUDE',
+            NULL, NULL, 'NOT_FETCHED', 0
+        );
+        INSERT INTO search_hits VALUES ('run-older', 'older-excluded');
+        """
+    )
+    connection.commit()
+    connection.close()
+    monkeypatch.setattr(views, "DATABASE_PATH", database_path)
+
+    options = views.load_review_scope_options()
+    latest = views.load_prefetch_groups("EXCLUDED", "Latest run", 25, 0)
+    older = views.load_prefetch_groups(
+        "EXCLUDED",
+        "run:run-older",
+        25,
+        0,
+    )
+    all_runs = views.load_prefetch_groups("EXCLUDED", "All runs", 25, 0)
+    invalid = views.load_prefetch_groups("EXCLUDED", "invalid", 25, 0)
+
+    assert list(options) == ["Latest run", "run:run-older", "All runs"]
+    assert "8 jobs" in options["Latest run"]
+    assert latest["run_id"] == "run-latest"
+    assert latest["total_jobs"] == 2
+    assert older["run_id"] == "run-older"
+    assert older["total_jobs"] == 1
+    assert all_runs["run_id"] is None
+    assert all_runs["total_jobs"] == 3
+    assert invalid["run_id"] == "run-latest"
+    assert invalid["total_jobs"] == 2
+
+
+def test_review_subtabs_remember_independent_run_scopes(tmp_path, monkeypatch):
+    database_path = tmp_path / "prefetch-tab-scopes.db"
+    _create_prefetch_database(database_path)
+    monkeypatch.setattr(views, "DATABASE_PATH", database_path)
+    monkeypatch.setattr(views, "review_view", "PENDING")
+    monkeypatch.setattr(views, "scope", "Latest run")
+    monkeypatch.setattr(
+        views,
+        "review_scope_by_view",
+        {
+            "PENDING": "Latest run",
+            "FORWARD": "Latest run",
+            "EXCLUDED": "Latest run",
+        },
+    )
+    monkeypatch.setattr(views, "review_scope_select", None)
+    monkeypatch.setattr(views, "refresh_review", lambda: None)
+
+    views.scope_changed(SimpleNamespace(value="All runs"))
+    assert views.scope == "All runs"
+
+    views.review_view_changed(SimpleNamespace(value="EXCLUDED"))
+    assert views.review_view == "EXCLUDED"
+    assert views.scope == "Latest run"
+
+    views.review_view_changed(SimpleNamespace(value="PENDING"))
+    assert views.scope == "All runs"
 
 
 def test_afternoon_quotes_all_ten_queries_for_both_markets():

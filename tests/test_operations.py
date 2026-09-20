@@ -158,6 +158,40 @@ def test_restart_marks_abandoned_task_and_unconfirmed_delivery(history_db):
     assert history["notification_events"][0]["status"] == "UNKNOWN"
 
 
+def test_active_recorded_tasks_reconciles_abandoned_rows(history_db):
+    stale_id = operations._write(
+        "INSERT INTO task_runs(task_name,process_id,started_at,status) "
+        "VALUES ('stale-search',123,'2026-09-12','RUNNING')",
+    )
+    operations._write(
+        "INSERT INTO notification_events(task_run_id,notification_type,started_at,status) "
+        "VALUES (?,'search_complete','2026-09-12','SENDING')",
+        (stale_id,),
+    )
+
+    assert operations.active_recorded_tasks({"stale-search"}) == set()
+
+    history = operations.recent_history()
+    assert history["task_runs"][0]["status"] == "INTERRUPTED"
+    assert history["task_runs"][0]["completed_at"] is not None
+    assert history["notification_events"][0]["status"] == "UNKNOWN"
+
+
+def test_active_recorded_tasks_preserves_a_locked_worker(history_db):
+    operations._write(
+        "INSERT INTO task_runs(task_name,process_id,started_at,status) "
+        "VALUES ('active-search',123,'2026-09-12','RUNNING')",
+    )
+
+    with operations.task_lock("active-search") as acquired:
+        assert acquired
+        assert operations.active_recorded_tasks({"active-search"}) == {
+            "active-search"
+        }
+
+    assert operations.recent_history()["task_runs"][0]["status"] == "RUNNING"
+
+
 def test_login_recovery_never_continues_ai_or_sends_second_email_for_new_search(history_db, monkeypatch):
     monkeypatch.setattr(windows_automation, "apply_migrations", list)
     monkeypatch.setattr(windows_automation, "run_windows_nightly_worker", lambda: {

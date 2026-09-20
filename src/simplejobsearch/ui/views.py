@@ -4,7 +4,9 @@ import hashlib
 import json
 import re
 import sqlite3
+import unicodedata
 from datetime import datetime
+from html import escape
 from pathlib import Path
 
 import pandas as pd
@@ -16,6 +18,7 @@ from post_ai_engine import run_all_extracted_jobs
 from simplejobsearch.config import get_settings
 from simplejobsearch.db import apply_migrations, database
 from simplejobsearch.db import connect as shared_connect
+from simplejobsearch.operations import active_recorded_tasks
 from simplejobsearch.pipeline.orchestrator import (
     PendingReviewError,
     continue_after_review,
@@ -42,10 +45,9 @@ DATABASE_PATH = SETTINGS.database_path
 
 TIMEZONE = SETTINGS.timezone
 
-SCOPE_OPTIONS = [
-    "Latest run",
-    "All pending",
-]
+LATEST_REVIEW_RUN_SCOPE = "Latest run"
+ALL_REVIEW_RUNS_SCOPE = "All runs"
+REVIEW_RUN_SCOPE_PREFIX = "run:"
 
 PREFETCH_SCOPE_OPTIONS = [
     "Latest run",
@@ -61,6 +63,42 @@ RECOMMENDED_JOBS_SCOPE_OPTIONS = [
     "Latest run",
     "All recommended jobs",
 ]
+
+RECOMMENDED_JOB_MAPS = {
+    "Netherlands": {
+        "center": (52.1326, 5.2913),
+        "zoom": 7,
+        "locations": {
+            "amsterdam": (52.3676, 4.9041),
+            "arnhem": (51.9851, 5.8987),
+            "breda": (51.5719, 4.7683),
+            "delft": (52.0116, 4.3571),
+            "eindhoven": (51.4416, 5.4697),
+            "leusden": (52.1320, 5.4312),
+            "renswoude": (52.0733, 5.5403),
+            "rotterdam": (51.9244, 4.4777),
+            "south holland": (52.0000, 4.5000),
+            "the hague": (52.0705, 4.3007),
+            "utrecht": (52.0907, 5.1214),
+            "varsseveld": (51.9433, 6.4583),
+            "woerden": (52.0850, 4.8833),
+            "zaandam": (52.4385, 4.8264),
+        },
+    },
+    "Switzerland": {
+        "center": (46.8182, 8.2275),
+        "zoom": 7,
+        "locations": {
+            "bern": (46.9480, 7.4474),
+            "geneva": (46.2044, 6.1432),
+            "lausanne": (46.5197, 6.6323),
+            "lugano": (46.0037, 8.9511),
+            "orbe": (46.7250, 6.5320),
+            "winterthur": (47.4988, 8.7241),
+            "zurich": (47.3769, 8.5417),
+        },
+    },
+}
 
 PREFETCH_VIEW_LABELS = {
     "FORWARD": "Going forward",
@@ -238,14 +276,20 @@ POST_AI_ACTION_OPTIONS = [
 # app ever needs multiple simultaneous users.
 # =============================================================================
 
-scope = "Latest run"
+scope = LATEST_REVIEW_RUN_SCOPE
 batch_size = 25
 batch_index = 0
 review_view = "PENDING"
+review_scope_by_view = {
+    "PENDING": LATEST_REVIEW_RUN_SCOPE,
+    "FORWARD": LATEST_REVIEW_RUN_SCOPE,
+    "EXCLUDED": LATEST_REVIEW_RUN_SCOPE,
+}
 review_filter_column = "title"
 review_filter_text = ""
 
 grid = None
+review_scope_select = None
 status_label = None
 batch_label = None
 pending_jobs_label = None
@@ -382,6 +426,83 @@ def latest_run_id(
     ).fetchone()
 
     return row["run_id"] if row else None
+
+
+def resolve_review_run_id(
+    connection: sqlite3.Connection,
+    requested_scope: str,
+) -> str | None:
+    """Resolve a Review Inbox scope without leaking invalid values into all history."""
+
+    requested_scope = str(requested_scope or "").strip()
+    if requested_scope in {ALL_REVIEW_RUNS_SCOPE, "All pending"}:
+        return None
+    if requested_scope.startswith(REVIEW_RUN_SCOPE_PREFIX):
+        requested_run_id = requested_scope[len(REVIEW_RUN_SCOPE_PREFIX):].strip()
+        row = connection.execute(
+            """
+            SELECT run_id
+            FROM search_runs
+            WHERE run_id = ?
+              AND status IN ('SUCCESS', 'PARTIAL')
+            """,
+            (requested_run_id,),
+        ).fetchone()
+        if row is not None:
+            return str(row["run_id"])
+    return latest_run_id(connection)
+
+
+def _review_run_label(started_at: object, job_count: object) -> str:
+    raw_started_at = str(started_at or "").strip()
+    try:
+        started = datetime.fromisoformat(raw_started_at)
+        if started.tzinfo is not None:
+            started = started.astimezone(TIMEZONE)
+        timestamp = started.strftime("%d %b %Y %H:%M")
+    except ValueError:
+        timestamp = raw_started_at or "Unknown time"
+    return f"{timestamp} — {int(job_count or 0)} jobs"
+
+
+def load_review_scope_options() -> dict[str, str]:
+    """Return Latest, every completed search run, and an all-runs option."""
+
+    connection = connect_database()
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+                sr.run_id,
+                sr.started_at,
+                COUNT(DISTINCT sh.job_id) AS job_count
+            FROM search_runs sr
+            LEFT JOIN search_hits sh ON sh.run_id = sr.run_id
+            WHERE sr.status IN ('SUCCESS', 'PARTIAL')
+            GROUP BY sr.run_id, sr.started_at
+            ORDER BY sr.started_at DESC
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    options: dict[str, str] = {}
+    if rows:
+        latest = rows[0]
+        options[LATEST_REVIEW_RUN_SCOPE] = (
+            "Latest run — "
+            + _review_run_label(latest["started_at"], latest["job_count"])
+        )
+        for row in rows[1:]:
+            run_id = str(row["run_id"])
+            options[f"{REVIEW_RUN_SCOPE_PREFIX}{run_id}"] = (
+                _review_run_label(row["started_at"], row["job_count"])
+                + f" — {run_id}"
+            )
+    else:
+        options[LATEST_REVIEW_RUN_SCOPE] = LATEST_REVIEW_RUN_SCOPE
+    options[ALL_REVIEW_RUNS_SCOPE] = "All runs — all unfetched jobs"
+    return options
 
 
 
@@ -965,11 +1086,7 @@ def load_pending_groups(
     connection = connect_database()
 
     try:
-        run_id = (
-            latest_run_id(connection)
-            if requested_scope == "Latest run"
-            else None
-        )
+        run_id = resolve_review_run_id(connection, requested_scope)
 
         params: list[str] = []
         run_filter = ""
@@ -2089,7 +2206,7 @@ def load_prefetch_groups(
 
     connection = connect_database()
     try:
-        run_id = latest_run_id(connection) if requested_scope == "Latest run" else None
+        run_id = resolve_review_run_id(connection, requested_scope)
         params: list[str] = []
         filters = [
             "(j.details_status IS NULL OR TRIM(j.details_status) = '' "
@@ -3137,6 +3254,151 @@ def load_recommended_jobs(
     return load_final_review_jobs("ACCEPTED", scope_value)
 
 
+def _normalize_map_location(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = text.encode("ascii", "ignore").decode("ascii").casefold()
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _recommended_location_point(location: object) -> tuple[str, tuple[float, float]] | None:
+    """Resolve a LinkedIn location to a supported country and map point."""
+
+    normalized = _normalize_map_location(location)
+    if not normalized:
+        return None
+
+    if "switzerland" in normalized:
+        countries = ("Switzerland",)
+    elif "netherlands" in normalized:
+        countries = ("Netherlands",)
+    else:
+        countries = tuple(RECOMMENDED_JOB_MAPS)
+
+    location_parts = [part.strip() for part in normalized.split(",") if part.strip()]
+    for country in countries:
+        known_locations = RECOMMENDED_JOB_MAPS[country]["locations"]
+        for part in location_parts:
+            if part in known_locations:
+                return country, known_locations[part]
+    return None
+
+
+def recommended_jobs_map_data(rows: list[dict]) -> dict[str, list]:
+    """Group recommended jobs into one marker per resolved map point."""
+
+    grouped: dict[str, dict[str, dict]] = {
+        "Netherlands": {},
+        "Switzerland": {},
+    }
+    unmapped: list[dict] = []
+
+    for row in rows:
+        resolved = _recommended_location_point(row.get("location"))
+        if resolved is None:
+            unmapped.append(row)
+            continue
+        country, coordinates = resolved
+        location = str(row.get("location") or "Unknown location").strip()
+        key = f"{coordinates[0]:.4f},{coordinates[1]:.4f}"
+        marker = grouped[country].setdefault(
+            key,
+            {
+                "location": location,
+                "coordinates": coordinates,
+                "jobs": [],
+            },
+        )
+        marker["jobs"].append(row)
+
+    return {
+        country: sorted(
+            markers.values(),
+            key=lambda marker: str(marker["location"]).casefold(),
+        )
+        for country, markers in grouped.items()
+    } | {"unmapped": unmapped}
+
+
+def _recommended_jobs_popup(marker: dict) -> str:
+    jobs = sorted(
+        marker["jobs"],
+        key=lambda row: (
+            str(row.get("company") or "").casefold(),
+            str(row.get("title") or "").casefold(),
+        ),
+    )
+    entries = []
+    for row in jobs:
+        title = escape(str(row.get("title") or "Untitled job"))
+        company = escape(str(row.get("company") or "Unknown company"))
+        url = str(row.get("job_url_direct") or row.get("job_url") or "").strip()
+        label = f"<strong>{title}</strong><br><span>{company}</span>"
+        if re.match(r"^https?://", url, flags=re.IGNORECASE):
+            label = (
+                f'<a href="{escape(url, quote=True)}" target="_blank" '
+                f'rel="noopener noreferrer">{label}</a>'
+            )
+        entries.append(f'<li style="margin-bottom:8px">{label}</li>')
+
+    location = escape(str(marker["location"]))
+    return (
+        '<div style="min-width:250px;max-width:380px">'
+        f'<div style="font-size:15px;font-weight:700;margin-bottom:8px">{location}</div>'
+        f'<div style="margin-bottom:8px">{len(jobs)} recommended '
+        f'{"job" if len(jobs) == 1 else "jobs"}</div>'
+        f'<ul style="padding-left:18px;margin:0">{"".join(entries)}</ul>'
+        "</div>"
+    )
+
+
+def _render_recommended_jobs_map(country: str, markers: list[dict]) -> None:
+    config = RECOMMENDED_JOB_MAPS[country]
+    job_count = sum(len(marker["jobs"]) for marker in markers)
+
+    with ui.card().classes("flex-1 w-full").style("min-width: 320px;"):
+        ui.label(country).classes("text-xl font-bold")
+        ui.label(
+            f"{job_count} jobs across {len(markers)} mapped locations"
+        ).classes("text-sm text-gray-400")
+        job_map = ui.leaflet(
+            center=config["center"],
+            zoom=config["zoom"],
+            options={"scrollWheelZoom": False},
+        ).classes("w-full rounded-lg").style("height: 430px; min-height: 430px;")
+
+        popup_bindings = []
+        for marker_data in markers:
+            job_marker = job_map.marker(
+                latlng=marker_data["coordinates"],
+                options={
+                    "title": (
+                        f"{marker_data['location']} — "
+                        f"{len(marker_data['jobs'])} recommended jobs"
+                    ),
+                },
+            )
+            popup_bindings.append((job_marker, _recommended_jobs_popup(marker_data)))
+
+        async def initialize_map() -> None:
+            await job_map.initialized()
+            for job_marker, popup in popup_bindings:
+                job_marker.run_method("bindPopup", popup, {"maxWidth": 400})
+            if markers:
+                latitudes = [marker["coordinates"][0] for marker in markers]
+                longitudes = [marker["coordinates"][1] for marker in markers]
+                bounds = [
+                    [min(latitudes), min(longitudes)],
+                    [max(latitudes), max(longitudes)],
+                ]
+                job_map.run_map_method(
+                    "fitBounds",
+                    bounds,
+                    {"padding": [24, 24], "maxZoom": 10},
+                )
+
+        ui.timer(0.1, initialize_map, once=True)
+
+
 def final_review_grid_options(rows: list[dict]) -> dict:
     return {
         **MOBILE_GRID_EVENT_HANDLERS,
@@ -3619,12 +3881,12 @@ def show_job_detail_dialog(
                     "text-sm text-gray-400"
                 )
 
-        if row.get("post_ai_reason_display"):
-            ui.label(
-                "Post-AI proposal reason: " + row["post_ai_reason_display"]
-            ).classes("text-sm text-gray-400")
-        if row.get("post_ai_rule_notes"):
-            ui.label(row["post_ai_rule_notes"]).classes("text-sm text-gray-400")
+            if row.get("post_ai_reason_display"):
+                ui.label(
+                    "Post-AI proposal reason: " + row["post_ai_reason_display"]
+                ).classes("text-sm text-gray-400")
+            if row.get("post_ai_rule_notes"):
+                ui.label(row["post_ai_rule_notes"]).classes("text-sm text-gray-400")
 
             if row[
                 "ai_status"
@@ -5943,20 +6205,15 @@ def refresh_continue_pipeline_state():
             for button in pipeline_buttons:
                 button.disable()
 
-        active_tasks = {
-            str(row["task_name"])
-            for row in connection.execute(
-                """
-                SELECT task_name
-                FROM task_runs
-                WHERE status = 'RUNNING'
-                  AND task_name IN (
-                    'continue_pipeline', 'search_again',
-                    'discovery', 'nightly_search', 'afternoon_quoted_search'
-                  )
-                """
-            )
-        }
+        active_tasks = active_recorded_tasks(
+            {
+                "continue_pipeline",
+                "search_again",
+                "discovery",
+                "nightly_search",
+                "afternoon_quoted_search",
+            }
+        )
         pipeline_running = "continue_pipeline" in active_tasks
         search_running = bool(
             active_tasks.intersection(
@@ -6259,6 +6516,14 @@ def close_review_portal_from_ui():
 
 
 def refresh_review():
+    global scope
+
+    options = load_review_scope_options()
+    if scope not in options:
+        scope = LATEST_REVIEW_RUN_SCOPE
+        review_scope_by_view[review_view] = scope
+    if review_scope_select is not None:
+        review_scope_select.set_options(options, value=scope)
     review_grid_area.refresh()
     refresh_continue_pipeline_state()
 
@@ -6379,7 +6644,13 @@ def scope_changed(event):
     global scope
     global batch_index
 
-    scope = event.value
+    selected_scope = str(event.value or "").strip()
+    scope = (
+        selected_scope
+        if selected_scope in load_review_scope_options()
+        else LATEST_REVIEW_RUN_SCOPE
+    )
+    review_scope_by_view[review_view] = scope
     batch_index = 0
 
     refresh_review()
@@ -6478,6 +6749,7 @@ def review_filter_text_changed(event):
 
 def review_view_changed(event):
     global review_view
+    global scope
     global batch_index
 
     selected = str(
@@ -6493,6 +6765,12 @@ def review_view_changed(event):
         }
         else "PENDING"
     )
+    scope = review_scope_by_view.get(review_view, LATEST_REVIEW_RUN_SCOPE)
+    if review_scope_select is not None:
+        review_scope_select.set_options(
+            load_review_scope_options(),
+            value=scope,
+        )
     batch_index = 0
     refresh_review()
 
@@ -6844,6 +7122,7 @@ def build_recommended_jobs_tab() -> None:
     @ui.refreshable
     def recommended_jobs_area() -> None:
         all_rows = load_recommended_jobs(state["scope"])
+        map_data = recommended_jobs_map_data(all_rows)
         total_pages = max(1, (len(all_rows) + state["size"] - 1) // state["size"])
         state["index"] = min(state["index"], total_pages - 1)
         start = state["index"] * state["size"]
@@ -6914,6 +7193,26 @@ def build_recommended_jobs_tab() -> None:
                 "btn-nav"
             )
 
+        ui.label("Recommended Jobs Map").classes("text-xl font-bold mt-4")
+        ui.label(
+            "The maps show every recommended job in the selected scope, "
+            "independent of the table page. Click a marker to open its jobs."
+        ).classes("text-sm text-gray-400")
+        with ui.row().classes("w-full gap-4 items-stretch flex-wrap"):
+            _render_recommended_jobs_map(
+                "Netherlands",
+                map_data["Netherlands"],
+            )
+            _render_recommended_jobs_map(
+                "Switzerland",
+                map_data["Switzerland"],
+            )
+        if map_data["unmapped"]:
+            ui.label(
+                f"{len(map_data['unmapped'])} recommended jobs are not plotted "
+                "because their LinkedIn location is missing or unsupported."
+            ).classes("text-sm text-amber-400")
+
         with ui.row().classes("w-full items-center gap-3 mobile-action-bar"):
             ui.button("Read selected job", on_click=read_selected).props(
                 "unelevated"
@@ -6948,7 +7247,7 @@ def _initial_ui_view(request: Request | None) -> str:
 
 
 def build_ui(request: Request | None = None) -> None:
-    global grid, status_label, batch_label
+    global grid, review_scope_select, status_label, batch_label
     global pending_jobs_label, pending_groups_label, visible_groups_label
     global continue_pipeline_button, continue_all_pipeline_button
     global run_search_again_button, pipeline_status_label
@@ -7410,13 +7709,16 @@ def build_ui(request: Request | None = None) -> None:
                     "w-full items-end gap-4 mobile-controls"
                 ):
 
-                    ui.select(
-                        SCOPE_OPTIONS,
+                    review_scope_select = ui.select(
+                        load_review_scope_options(),
                         value=scope,
-                        label="Review scope",
+                        label="Search run",
                         on_change=scope_changed,
+                        with_input=True,
+                    ).props(
+                        "options-dense"
                     ).classes(
-                        "w-64"
+                        "w-[34rem] max-w-full"
                     )
 
                     ui.select(

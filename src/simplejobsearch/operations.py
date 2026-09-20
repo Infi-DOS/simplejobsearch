@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
@@ -87,6 +87,65 @@ def task_lock(task_name: str):
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def active_recorded_tasks(task_names: Iterable[str]) -> set[str]:
+    """Return genuinely active recorded tasks and reconcile abandoned rows.
+
+    A worker can be terminated before ``recorded_task`` writes its outcome. The
+    database row then remains RUNNING, while the OS-owned task lock is released.
+    Treat the lock as authoritative and make the interrupted state durable.
+    """
+
+    requested = tuple(dict.fromkeys(str(name) for name in task_names if name))
+    if not requested:
+        return set()
+    path = get_settings().database_path
+    if not path.exists():
+        return set()
+
+    connection = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=5)
+    try:
+        placeholders = ",".join("?" for _ in requested)
+        candidates = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT DISTINCT task_name FROM task_runs "
+                f"WHERE status='RUNNING' AND task_name IN ({placeholders})",
+                requested,
+            )
+        }
+        active: set[str] = set()
+        for task_name in candidates:
+            with task_lock(task_name) as available:
+                if not available:
+                    active.add(task_name)
+                    continue
+                interrupted_at = timestamp()
+                connection.execute(
+                    "UPDATE task_runs SET status='INTERRUPTED',completed_at=?,error=? "
+                    "WHERE task_name=? AND status='RUNNING'",
+                    (
+                        interrupted_at,
+                        "Worker ended without recording an outcome",
+                        task_name,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE notification_events SET status='UNKNOWN',completed_at=?,reason=? "
+                    "WHERE status='SENDING' AND task_run_id IN "
+                    "(SELECT task_run_id FROM task_runs "
+                    "WHERE task_name=? AND status='INTERRUPTED')",
+                    (
+                        interrupted_at,
+                        "worker_interrupted_delivery_unconfirmed",
+                        task_name,
+                    ),
+                )
+        connection.commit()
+        return active
+    finally:
+        connection.close()
 
 
 def recorded_task(task_name: str):

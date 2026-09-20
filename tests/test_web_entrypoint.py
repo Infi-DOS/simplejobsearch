@@ -529,6 +529,103 @@ def test_recommended_jobs_loader_uses_only_human_kept_rows(monkeypatch):
     assert calls == [("ACCEPTED", "All recommended jobs")]
 
 
+def test_recommended_jobs_map_data_groups_supported_locations():
+    from simplejobsearch.ui import views
+
+    rows = [
+        {
+            "job_id": "nl-1",
+            "title": "AI Engineer",
+            "company": "Example NL",
+            "location": "Amsterdam, North Holland, Netherlands",
+            "job_url": "https://example.com/nl-1",
+        },
+        {
+            "job_id": "nl-2",
+            "title": "ML Engineer",
+            "company": "Example NL",
+            "location": "Amsterdam, North Holland, Netherlands",
+            "job_url": "https://example.com/nl-2",
+        },
+        {
+            "job_id": "ch-1",
+            "title": "Data Scientist",
+            "company": "Example CH",
+            "location": "Zürich, Zurich, Switzerland",
+            "job_url": "https://example.com/ch-1",
+        },
+        {
+            "job_id": "ch-2",
+            "title": "Machine Learning Engineer",
+            "company": "Example CH",
+            "location": "Zurich, Switzerland",
+            "job_url": "https://example.com/ch-2",
+        },
+        {
+            "job_id": "missing",
+            "title": "Unknown location",
+            "company": "Example",
+            "location": None,
+        },
+    ]
+
+    data = views.recommended_jobs_map_data(rows)
+
+    assert len(data["Netherlands"]) == 1
+    assert data["Netherlands"][0]["coordinates"] == (52.3676, 4.9041)
+    assert len(data["Netherlands"][0]["jobs"]) == 2
+    assert len(data["Switzerland"]) == 1
+    assert data["Switzerland"][0]["coordinates"] == (47.3769, 8.5417)
+    assert len(data["Switzerland"][0]["jobs"]) == 2
+    assert [row["job_id"] for row in data["unmapped"]] == ["missing"]
+
+
+def test_job_description_dialog_renders_without_post_ai_rule_notes():
+    from nicegui import context
+    from simplejobsearch.ui import views
+
+    client = context.client
+    existing_ids = set(client.elements)
+    views.show_job_detail_dialog(
+        {
+            "title": "AI Engineer",
+            "company": "Example",
+            "location": "Amsterdam",
+            "job_type": "FULL_TIME",
+            "job_level": "",
+            "classifier_status": "AUTO_KEEP",
+            "metadata_gate_status": "PASS",
+            "metadata_gate_reason": "",
+            "ai_status": "",
+            "description": "Distinct full job description.",
+            "job_url": "https://example.test/job",
+            "job_url_direct": "",
+        }
+    )
+    elements = [
+        element
+        for element_id, element in client.elements.items()
+        if element_id not in existing_ids
+    ]
+
+    markdown = next(
+        element for element in elements if element.__class__.__name__ == "Markdown"
+    )
+    ancestors = []
+    parent = markdown.parent_slot.parent
+    while parent is not None:
+        ancestors.append(parent.__class__.__name__)
+        parent_slot = getattr(parent, "parent_slot", None)
+        parent = parent_slot.parent if parent_slot is not None else None
+
+    assert markdown.content == "Distinct full job description."
+    assert "Card" in ancestors
+    assert any(
+        element.__class__.__name__ == "Button" and element.text == "Close"
+        for element in elements
+    )
+
+
 def test_workflow_grids_unpin_columns_on_mobile_clients():
     from simplejobsearch.ui import views
 
